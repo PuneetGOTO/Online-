@@ -1,0 +1,116 @@
+"""多節點分配與分散式執行。
+
+JMeter 分散式模式的重點：每個 remote engine 會各自跑一份計畫，
+所以「總併發 = 每節點執行緒 × 節點數」。本模組負責把請求的總併發
+平均攤到可用節點，並回報實際併發（可能略高於請求值）。
+"""
+import asyncio
+import math
+from pathlib import Path
+
+
+async def node_alive(host: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def check_nodes(nodes: dict) -> dict:
+    tasks = {
+        key: asyncio.create_task(node_alive(cfg["host"], cfg.get("port", 1099)))
+        for key, cfg in nodes.items()
+        if cfg.get("enabled", True)
+    }
+    return {key: await task for key, task in tasks.items()}
+
+
+def effective_capacity(nodes: dict) -> int:
+    """實際可承載的總併發。
+
+    JMeter 分散式模式下每個 engine 跑相同的執行緒數，所以 n 個節點的有效容量
+    是 min(各節點上限) × n，而不是各節點上限相加。
+    """
+    active = sorted(
+        (v.get("max_threads", 0) for v in nodes.values() if v.get("enabled", True)),
+        reverse=True,
+    )
+    best = 0
+    for n in range(1, len(active) + 1):
+        best = max(best, active[n - 1] * n)
+    return best
+
+
+def allocate(total_threads: int, nodes: dict) -> tuple[list, int, int]:
+    """回傳 (選中節點 [(key, cfg)], 每節點執行緒, 實際總併發)。"""
+    active = [
+        (k, v) for k, v in nodes.items()
+        if v.get("enabled", True)
+    ]
+    active.sort(key=lambda kv: kv[1].get("max_threads", 0), reverse=True)
+    for n in range(len(active), 0, -1):
+        per_node = math.ceil(total_threads / n)
+        chosen = active[:n]
+        if all(per_node <= cfg.get("max_threads", 10 ** 9) for _, cfg in chosen):
+            return chosen, per_node, per_node * n
+    return [], 0, 0
+
+
+def compute_ramp(per_node: int, duration: int) -> int:
+    """爬升期不得超過測試時長的三分之一，否則執行緒還沒拉滿測試就結束。"""
+    return max(5, min(per_node // 2 or 5, max(5, duration // 3)))
+
+
+def build_command(
+    jmeter_bin: str,
+    plan: Path,
+    nodes: list,
+    per_node: int,
+    duration: int,
+    host: str,
+    jtl: Path,
+    report: Path,
+) -> list[str]:
+    hosts = ",".join(cfg["host"] + (f":{cfg['port']}" if cfg.get("port", 1099) != 1099 else "")
+                     for _, cfg in nodes)
+    ramp = compute_ramp(per_node, duration)
+    return [
+        jmeter_bin,
+        "-n",
+        "-t", str(plan),
+        "-R", hosts,
+        "-Dserver.rmi.ssl.disable=true",
+        f"-Ghost={host}",
+        f"-Gthreads={per_node}",
+        f"-Gramp={ramp}",
+        f"-Gduration={duration}",
+        "-l", str(jtl),
+        "-e", "-o", str(report),
+    ]
+
+
+async def run_distributed(cmd: list[str], jtl: Path, cwd: Path, on_progress, poll: int = 10) -> int:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    while proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=poll)
+        except asyncio.TimeoutError:
+            count = 0
+            if jtl.exists():
+                with open(jtl, encoding="utf-8", errors="replace") as f:
+                    count = max(0, sum(1 for _ in f) - 1)
+            await on_progress(count)
+    return proc.returncode

@@ -1,0 +1,12 @@
+{
+  "limits": {
+    "global_max_threads": 5000,
+    "global_max_duration": 1800
+  },
+  "settings": {
+    "allow_private_targets": false,
+    "verify_txt_prefix": "_loadtest-verify",
+    "verify_http_path": "/.well-known/loadtest-verify.txt"
+  },
+  "targets": {}
+}

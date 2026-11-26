@@ -1,0 +1,29 @@
+{
+  "_comment": "壓測產生節點（Ubuntu + jmeter-server）。max_threads 是該節點硬體能承載的執行緒上限，超出會被分配器排除。",
+  "nodes": {
+    "hk-01": {
+      "host": "10.0.1.21",
+      "port": 1099,
+      "region": "HK",
+      "max_threads": 600,
+      "enabled": true,
+      "note": "4 vCPU / 8G，單節點實測可穩定輸出約 3000 req/s 的靜態請求"
+    },
+    "sg-01": {
+      "host": "10.0.1.31",
+      "port": 1099,
+      "region": "SG",
+      "max_threads": 800,
+      "enabled": true,
+      "note": "8 vCPU / 16G"
+    },
+    "jp-01": {
+      "host": "10.0.1.41",
+      "port": 1099,
+      "region": "JP",
+      "max_threads": 500,
+      "enabled": false,
+      "note": "待部署，先停用"
+    }
+  }
+}

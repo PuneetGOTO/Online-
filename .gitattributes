@@ -1,0 +1,13 @@
+# 統一換行，避免 Windows 端提交的 CRLF 讓 Linux 上的 .sh 無法執行
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.jmx   text eol=lf
+*.example text eol=lf
+*.txt   text eol=lf
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
