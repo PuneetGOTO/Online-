@@ -152,6 +152,80 @@ main { max-width: 1180px; margin: 0 auto; padding: 22px 24px 64px; }
 .stat-value.mono { font-size: 17px; font-weight: 600; }
 .stat-hint { font-size: 11.5px; color: var(--muted); }
 
+/* ---------------------------------------------------------------- 壓測狀態 */
+.lt-panel {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 15px 20px;
+  margin-bottom: 14px;
+  border-left: 3px solid var(--line-strong);
+}
+.lt-panel.running { border-left-color: var(--accent); background: #fbfcff; }
+.lt-panel.done { border-left-color: var(--ok); }
+.lt-panel.failed, .lt-panel.aborted { border-left-color: var(--err); }
+.lt-panel.stale { border-left-color: var(--warn); }
+
+.lt-left { flex: 1; min-width: 0; }
+.lt-head { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+.lt-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--line-strong);
+  flex: none;
+  align-self: center;
+}
+.lt-panel.running .lt-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, .15);
+  animation: lt-pulse 1.6s ease-in-out infinite;
+}
+.lt-panel.done .lt-dot { background: var(--ok); }
+.lt-panel.failed .lt-dot, .lt-panel.aborted .lt-dot { background: var(--err); }
+.lt-panel.stale .lt-dot { background: var(--warn); }
+@keyframes lt-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(37, 99, 235, .15); }
+  50% { box-shadow: 0 0 0 6px rgba(37, 99, 235, .06); }
+}
+
+.lt-state { font-size: 14px; font-weight: 650; }
+.lt-target { font-size: 12.5px; color: var(--muted); }
+.lt-bar {
+  height: 6px;
+  background: #eef2f7;
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 9px 0 7px;
+}
+.lt-bar-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width .5s linear;
+}
+.lt-panel.done .lt-bar-fill { background: var(--ok); }
+.lt-panel.failed .lt-bar-fill, .lt-panel.aborted .lt-bar-fill { background: var(--err); }
+.lt-panel.idle .lt-bar { display: none; }
+.lt-meta { font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+.lt-meta b { color: var(--text-soft); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.lt-timer { text-align: right; flex: none; min-width: 118px; }
+.lt-timer-main {
+  display: block;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -.4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.lt-panel.idle .lt-timer-main { color: var(--line-strong); }
+.lt-timer-sub { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 860px) {
+  .lt-panel { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .lt-timer { text-align: left; }
+}
+
 /* ---------------------------------------------------------------- 動作列 */
 .actionbar {
   display: flex;

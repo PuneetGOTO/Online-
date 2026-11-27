@@ -121,6 +121,7 @@ function renderState(state) {
 
   renderNodes(nodes, job);
   renderBot(state.bot);
+  renderLoadtest(state.loadtest);
   if (job) renderJobChip(job);
 }
 
@@ -755,6 +756,93 @@ function setBotStatus(text, cls) {
   element.textContent = text;
   element.className = 'form-status' + (cls ? ' ' + cls : '');
 }
+
+/* ---------------------------------------------------------------- 壓測狀態 */
+
+let ltCache = null;
+
+const LT_LABELS = {
+  idle: '目前沒有壓測在執行',
+  running: '壓測執行中',
+  finished: '壓測結束，統計中…',
+  done: '上一次壓測完成',
+  failed: '上一次壓測失敗',
+  aborted: '上一次壓測已中止',
+  stale: '狀態不明（機器人可能已離線）',
+};
+
+function fmtNum(value) {
+  return Number(value || 0).toLocaleString('zh-TW');
+}
+
+function renderLoadtest(lt) {
+  ltCache = lt || { state: 'idle' };
+  const state = ltCache.state || 'idle';
+  $('#lt-panel').className = 'panel lt-panel ' + state;
+  $('#lt-state').textContent = LT_LABELS[state] || state;
+
+  const target = $('#lt-target');
+  if (ltCache.domain) {
+    target.textContent = ltCache.domain + (ltCache.client ? `（${ltCache.client}）` : '');
+  } else {
+    target.textContent = '';
+  }
+
+  const meta = [];
+  if (state === 'running' || state === 'finished') {
+    if (ltCache.threads) meta.push(`併發 <b>${ltCache.threads}</b>`);
+    if (ltCache.nodes && ltCache.nodes.length) {
+      meta.push(`節點 <b>${ltCache.nodes.map(esc).join('、')}</b>`);
+    }
+    if (ltCache.requests != null) meta.push(`已送回 <b>${fmtNum(ltCache.requests)}</b> 筆`);
+    if (ltCache.operator) meta.push(`操作者 <b>${esc(ltCache.operator)}</b>`);
+  } else if (state === 'done') {
+    if (ltCache.requests != null) meta.push(`請求 <b>${fmtNum(ltCache.requests)}</b>`);
+    if (ltCache.err_pct != null) meta.push(`錯誤 <b>${ltCache.err_pct}%</b>`);
+    if (ltCache.avg_ms != null) meta.push(`平均 <b>${ltCache.avg_ms} ms</b>`);
+    if (ltCache.p90_ms != null) meta.push(`P90 <b>${ltCache.p90_ms} ms</b>`);
+    meta.push(ltCache.ok
+      ? '<b style="color:var(--ok)">達標</b>'
+      : '<b style="color:var(--err)">未達標</b>');
+  } else if (state === 'failed' || state === 'aborted' || state === 'stale') {
+    if (ltCache.error) meta.push(esc(ltCache.error));
+    if (ltCache.domain) meta.push(`目標 <b>${esc(ltCache.domain)}</b>`);
+    if (ltCache.updated_at) meta.push(`更新於 ${esc(ltCache.updated_at.replace('T', ' '))}`);
+  }
+  $('#lt-meta').innerHTML = meta.length ? meta.join(' · ') : '<span>—</span>';
+
+  if (state === 'running') {
+    $('#lt-timer').textContent = `${ltCache.elapsed} / ${ltCache.duration} s`;
+    $('#lt-timer-sub').textContent = `剩餘 ${ltCache.remaining} s`;
+    $('#lt-bar').style.width = `${ltCache.progress}%`;
+  } else if (state === 'idle') {
+    $('#lt-timer').textContent = '—';
+    $('#lt-timer-sub').textContent = '';
+    $('#lt-bar').style.width = '0';
+  } else {
+    $('#lt-timer').textContent = `${ltCache.duration || ltCache.elapsed || 0} s`;
+    $('#lt-timer-sub').textContent = {
+      done: '已完成',
+      failed: '已失敗',
+      aborted: '已中止',
+      stale: '狀態不明',
+      finished: '統計中',
+    }[state] || '';
+    $('#lt-bar').style.width = '100%';
+  }
+}
+
+// 每秒在前端推算秒數，不必等 5 秒輪詢
+setInterval(() => {
+  if (!ltCache || ltCache.state !== 'running' || !ltCache.started_ts) return;
+  const duration = ltCache.duration || 0;
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - ltCache.started_ts));
+  const shown = duration ? Math.min(elapsed, duration) : elapsed;
+  $('#lt-timer').textContent = `${shown} / ${duration} s`;
+  $('#lt-timer-sub').textContent = `剩餘 ${Math.max(0, duration - elapsed)} s`;
+  $('#lt-bar').style.width =
+    `${duration ? Math.min(100, (elapsed / duration) * 100).toFixed(1) : 0}%`;
+}, 1000);
 
 /* ---------------------------------------------------------------- 啟動 */
 

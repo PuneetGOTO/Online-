@@ -357,6 +357,39 @@ def append_bot_log_marker(action: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------- 壓測狀態
+# bot.py 執行壓測時會把狀態寫進 results/loadtest-status.json
+
+LOADTEST_STATUS = PROJECT_DIR / "results" / "loadtest-status.json"
+
+
+def loadtest_status() -> dict:
+    if not LOADTEST_STATUS.exists():
+        return {"state": "idle"}
+    try:
+        data = json.loads(LOADTEST_STATUS.read_text(encoding="utf-8"))
+    except Exception:
+        return {"state": "idle"}
+
+    now = time.time()
+    started = float(data.get("started_ts") or 0)
+    duration = int(data.get("duration") or 0)
+    elapsed = int(now - started) if started else int(data.get("elapsed") or 0)
+    state = data.get("state") or "idle"
+
+    # 機器人掛掉時檔案會停在 running，超過時長太多就視為狀態不明
+    if state == "running" and duration and elapsed > duration + 120:
+        state = "stale"
+
+    data["state"] = state
+    data["elapsed"] = max(0, elapsed)
+    data["duration"] = duration
+    data["remaining"] = max(0, duration - elapsed) if duration else 0
+    data["progress"] = min(100, round(elapsed / duration * 100)) if duration else 0
+    data["age"] = int(now - started) if started else None
+    return data
+
+
 def _run_text(cmd: list[str], timeout: float = 10) -> str:
     """執行指令並以容錯方式解碼（Windows 中文主機常回 GBK）。"""
     try:
@@ -1007,6 +1040,7 @@ async def get_state(_=Depends(require_auth)):
         "nodes": items,
         "job": job.summary() if job else None,
         "bot": await asyncio.to_thread(bot_status),
+        "loadtest": await asyncio.to_thread(loadtest_status),
     }
 
 
@@ -1316,6 +1350,11 @@ async def bot_action(body: BotActionBody, request: Request, _=Depends(require_au
     status = await asyncio.to_thread(bot_status)
     audit("BOT-" + action.upper(), request.client.host if request.client else "-", status["service"])
     return {"ok": True, "action": action, "bot": status}
+
+
+@app.get("/api/loadtest")
+async def get_loadtest(_=Depends(require_auth)):
+    return await asyncio.to_thread(loadtest_status)
 
 
 @app.get("/api/nodes/{key}/inspect")

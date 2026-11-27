@@ -47,6 +47,39 @@ GUILD_ID = os.getenv("GUILD_ID")
 
 RUNNING = {"active": False, "proc": None, "started": None, "label": ""}
 
+# 執行狀態檔：網頁控制台靠它顯示「正在壓測 xxx，30/60s」
+STATUS_FILE = RESULTS_DIR / "loadtest-status.json"
+
+
+def write_status(state: str, **fields) -> None:
+    payload = {
+        "state": state,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        **fields,
+    }
+    try:
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
+
+def patch_status(**fields) -> None:
+    """保留既有欄位，只更新指定欄位（用於中止等沒有完整上下文的地方）。"""
+    try:
+        data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    data.update(fields)
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STATUS_FILE)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------- 設定讀寫
 def _read_json(path: Path) -> dict:
@@ -115,6 +148,23 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
     )
 
     node_names = ", ".join(k for k, _ in chosen)
+    started_ts = RUNNING["started"].timestamp()
+    base = {
+        "key": key,
+        "domain": target["domain"],
+        "client": target.get("client", ""),
+        "plan": target.get("plan", ""),
+        "threads": actual_total,
+        "per_node": per_node,
+        "nodes": [k for k, _ in chosen],
+        "duration": duration,
+        "started_ts": started_ts,
+        "operator": operator,
+        "override": override,
+    }
+    progress = {"count": 0, "elapsed": 0}
+    write_status("running", elapsed=0, requests=0, **base)
+
     embed = discord.Embed(
         title=f"壓測執行中 · {key}",
         description=f"目標 `{target['domain']}`\n"
@@ -128,6 +178,8 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
 
     async def on_progress(count: int) -> None:
         elapsed = int((datetime.now() - RUNNING["started"]).total_seconds())
+        progress["count"], progress["elapsed"] = count, elapsed
+        write_status("running", elapsed=elapsed, requests=count, **base)
         embed.set_field_at(0, name="已送回結果", value=f"{count:,}", inline=True)
         embed.set_field_at(1, name="已執行", value=f"{elapsed}s / {duration}s", inline=True)
         try:
@@ -140,9 +192,16 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
     except FileNotFoundError:
         await channel.send(f"找不到 JMeter：`{JMETER_BIN}`，請檢查 .env。")
         audit("ERROR", operator, "JMeter 不存在")
+        write_status("failed", elapsed=0, requests=0, error="找不到 JMeter", **base)
         return
     finally:
         RUNNING.update(active=False, proc=None)
+        write_status(
+            "finished",
+            elapsed=int(datetime.now().timestamp() - started_ts),
+            requests=progress["count"],
+            **base,
+        )
 
     if not jtl.exists():
         await channel.send(
@@ -150,10 +209,22 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
             "RMI 1099 埠不通、或 `server.rmi.ssl.disable` 未在 master 與節點同時設定。"
         )
         audit("FAIL", operator, f"{key} 無 jtl，rc={rc}")
+        write_status("failed", elapsed=duration, requests=progress["count"],
+                     error="未產生結果檔", **base)
         return
 
     s = compute_stats(jtl)
     ok = judge(s)
+    write_status(
+        "done",
+        elapsed=duration,
+        requests=s["total"],
+        ok=ok,
+        err_pct=round(s["err_pct"], 2),
+        avg_ms=round(s["avg"], 1),
+        p90_ms=round(s["p90"], 1),
+        **base,
+    )
     result = discord.Embed(
         title=f"壓測完成 · {key}",
         description=f"目標 `{target['domain']}` · {len(chosen)} 節點 × {per_node} = "
@@ -636,6 +707,7 @@ async def abort(interaction: discord.Interaction):
     proc.kill()
     RUNNING.update(active=False, proc=None)
     audit("ABORT", str(interaction.user), "手動中止")
+    patch_status(state="aborted", error="手動中止", updated_by=str(interaction.user))
     await interaction.response.send_message("已中止，流量停止。")
 
 
