@@ -681,6 +681,9 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 | 網頁按「啟動」報權限不足 | 缺少 sudoers 規則 | 重跑 `setup-master.sh`，或檢查 `/etc/sudoers.d/loadtest-web` |
 | Bot 顯示「啟動失敗」 | Token 錯誤或已被重置 | 看面板日誌，重新產生 Token 並貼上 |
 | Bot 啟動後馬上停止 | `OWNER_ID` 為空或格式錯 | 填數字 ID，不是使用者名稱 |
+| 部署卡在「安裝 JMeter」 | 官方 archive 鏡像只有 ~50 KB/s | 腳本已內建 dlcdn → 清華 → archive 三段回退，正常 1 分鐘內完成 |
+| 部署長時間無輸出 | 正在下載 85 MB 的 JMeter | 每 30 秒會顯示「仍在執行」，可按中止（會一併殺掉遠端程序） |
+| 節點顯示離線但部署成功 | 節點在 VPC 外，防火牆白名單寫成了內網 IP | 在 `.env` 設 `MASTER_IP=<公網IP>` 後重啟 `loadtest-web`，再重新部署節點 |
 
 **查看日誌**
 

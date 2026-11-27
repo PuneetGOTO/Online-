@@ -499,6 +499,14 @@ JOBS: dict[str, Job] = {}
 CURRENT: dict[str, Optional[Job]] = {"job": None, "last": None}
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _clean(text: str) -> str:
+    """移除 shell 腳本輸出的 ANSI 色碼。"""
+    return ANSI_RE.sub("", text)
+
+
 def _classify(line: str) -> str:
     low = line.lower()
     if "[fail]" in low or "error" in low or "denied" in low:
@@ -546,10 +554,30 @@ async def stream_cmd(job: Job, cmd: list[str], timeout: float = 1800) -> int:
                 break
             line = raw.decode("utf-8", "replace").rstrip()
             if line:
-                job.log(line, _classify(line))
+                job.log(_clean(line), _classify(line))
         return await proc.wait()
     finally:
         job.proc = None
+
+
+def _kill_remote(host: str, port: int, user: str, password: str) -> None:
+    """中止部署時清掉遠端殘留腳本與下載，否則它會在背景繼續跑。"""
+    try:
+        import paramiko
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, port=port, username=user, password=password,
+                       timeout=10, allow_agent=False, look_for_keys=False)
+        client.exec_command(
+            "pkill -f setup-node.sh 2>/dev/null; "
+            "pkill -f 'apache-jmeter-5.6.3.tgz' 2>/dev/null; true",
+            timeout=10,
+        )
+        time.sleep(1)
+        client.close()
+    except Exception:
+        pass
 
 
 def _deploy_blocking(job: Job, emit, host: str, ssh_port: int, user: str,
@@ -576,7 +604,7 @@ def _deploy_blocking(job: Job, emit, host: str, ssh_port: int, user: str,
         prefix = "bash" if user == "root" else "sudo -S -p '' bash"
         remote = (
             f"chmod +x /tmp/setup-node.sh && "
-            f"{prefix} /tmp/setup-node.sh {master_ip} {host} {name}"
+            f"{prefix} /tmp/setup-node.sh {master_ip} {host} {name} 2>&1"
         )
         emit(f"$ {remote}", "cmd")
         stdin, stdout, stderr = client.exec_command(remote, timeout=1800, get_pty=False)
@@ -584,15 +612,38 @@ def _deploy_blocking(job: Job, emit, host: str, ssh_port: int, user: str,
             stdin.write(password + "\n")
             stdin.flush()
 
-        for raw in iter(stdout.readline, ""):
+        channel = stdout.channel
+        channel.settimeout(5.0)
+        buffer = b""
+        idle = 0
+        while True:
             if job.cancel_flag:
-                emit("使用者中止，關閉連線", "warn")
+                emit("使用者中止，終止遠端程序", "warn")
+                _kill_remote(host, ssh_port, user, password)
                 return False
-            line = raw.rstrip()
-            if line:
-                emit(line, _classify(line))
+            try:
+                chunk = channel.recv(4096)
+            except socket.timeout:
+                idle += 5
+                if idle % 30 == 0:
+                    emit(f"… 仍在執行（已 {idle} 秒無新輸出，下載或編譯可能較久）", "info")
+                continue
+            except Exception:
+                break
+            if not chunk:
+                break
+            idle = 0
+            buffer += chunk
+            while b"\n" in buffer:
+                raw, buffer = buffer.split(b"\n", 1)
+                line = raw.decode("utf-8", "replace").rstrip("\r")
+                if line.strip():
+                    emit(_clean(line), _classify(line))
 
-        rc = stdout.channel.recv_exit_status()
+        if buffer.strip():
+            emit(_clean(buffer.decode("utf-8", "replace")), "info")
+
+        rc = channel.recv_exit_status()
         if rc != 0:
             err = stderr.read().decode("utf-8", "replace").strip()
             if err:

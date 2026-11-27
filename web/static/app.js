@@ -525,14 +525,13 @@ async function pollJob() {
 function renderJob(job) {
   const chip = $('#job-chip');
   const map = {
-    running: ['執行中', 'run'],
-    success: ['成功', 'ok'],
-    failed: ['有失敗', 'err'],
-    cancelled: ['已中止', 'warn'],
+    running: 'run',
+    success: 'ok',
+    failed: 'err',
+    cancelled: 'warn',
   };
-  const [label, cls] = map[job.status] || ['—', ''];
-  chip.textContent = label;
-  chip.className = 'chip ' + cls;
+  chip.textContent = jobLabel(job);
+  chip.className = 'chip ' + (map[job.status] || '');
 
   $('#btn-cancel').classList.toggle('hidden', job.status !== 'running');
   $('#btn-clear-log').disabled = job.status === 'running';
@@ -541,22 +540,29 @@ function renderJob(job) {
   if (Array.isArray(job.lines)) {
     const log = $('#log');
     const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    const previousTop = log.scrollTop;
     log.innerHTML = job.lines.map(lineHtml).join('') || '<div class="log-empty">（無輸出）</div>';
-    if (nearBottom) log.scrollTop = log.scrollHeight;
+    log.scrollTop = nearBottom ? log.scrollHeight : previousTop;
   }
+}
+
+function jobLabel(job) {
+  const names = { running: '執行中', success: '成功', failed: '有失敗', cancelled: '已中止' };
+  let label = names[job.status] || '—';
+  if (job.status === 'running' && job.started) {
+    const seconds = Math.max(0, Math.floor(Date.now() / 1000 - job.started));
+    const mm = String(Math.floor(seconds / 60)).padStart(2, '0');
+    const ss = String(seconds % 60).padStart(2, '0');
+    label += ` · ${mm}:${ss}`;
+  }
+  return label;
 }
 
 function renderJobChip(job) {
   const chip = $('#job-chip');
-  const map = {
-    running: ['執行中', 'run'],
-    success: ['成功', 'ok'],
-    failed: ['有失敗', 'err'],
-    cancelled: ['已中止', 'warn'],
-  };
-  const [label, cls] = map[job.status] || ['—', ''];
-  chip.textContent = label;
-  chip.className = 'chip ' + cls;
+  const map = { running: 'run', success: 'ok', failed: 'err', cancelled: 'warn' };
+  chip.textContent = jobLabel(job);
+  chip.className = 'chip ' + (map[job.status] || '');
 }
 
 $('#btn-cancel').addEventListener('click', async () => {
