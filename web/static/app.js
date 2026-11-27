@@ -796,6 +796,11 @@ function renderLoadtest(lt) {
 
   const meta = [];
   if (state === 'running' || state === 'finished') {
+    if (ltCache.mode === 'stepped') {
+      meta.push(`階段 <b>${ltCache.stage_index || 1}/${ltCache.stage_total || '?'}</b>`);
+      if (ltCache.stage_threads) meta.push(`本級 <b>${ltCache.stage_threads}</b> 併發`);
+      if (ltCache.stage_wait) meta.push(`間隔等待 <b>${ltCache.stage_wait}s</b>`);
+    }
     if (ltCache.threads) meta.push(`併發 <b>${ltCache.threads}</b>`);
     if (ltCache.nodes && ltCache.nodes.length) {
       meta.push(`節點 <b>${ltCache.nodes.map(esc).join('、')}</b>`);
@@ -803,6 +808,15 @@ function renderLoadtest(lt) {
     if (ltCache.requests != null) meta.push(`已送回 <b>${fmtNum(ltCache.requests)}</b> 筆`);
     if (ltCache.operator) meta.push(`操作者 <b>${esc(ltCache.operator)}</b>`);
   } else if (state === 'done') {
+    if (ltCache.mode === 'stepped') {
+      if (ltCache.knee_threads != null) {
+        meta.push(`拐點 <b>${ltCache.knee_threads}</b> 併發`);
+      }
+      if (ltCache.best_ok_rps != null) {
+        meta.push(`峰值成功 <b>${Math.round(ltCache.best_ok_rps)}</b> req/s`);
+      }
+      if (ltCache.stage_total) meta.push(`共 <b>${ltCache.stage_total}</b> 級`);
+    }
     if (ltCache.requests != null) meta.push(`請求 <b>${fmtNum(ltCache.requests)}</b>`);
     if (ltCache.err_pct != null) meta.push(`錯誤 <b>${ltCache.err_pct}%</b>`);
     if (ltCache.avg_ms != null) meta.push(`平均 <b>${ltCache.avg_ms} ms</b>`);
@@ -818,9 +832,22 @@ function renderLoadtest(lt) {
   $('#lt-meta').innerHTML = meta.length ? meta.join(' · ') : '<span>—</span>';
 
   if (state === 'running') {
-    $('#lt-timer').textContent = `${ltCache.elapsed} / ${ltCache.duration} s`;
-    $('#lt-timer-sub').textContent = `剩餘 ${ltCache.remaining} s`;
-    $('#lt-bar').style.width = `${ltCache.progress}%`;
+    if (ltCache.mode === 'stepped') {
+      const idx = ltCache.stage_index || 1;
+      const tot = ltCache.stage_total || 1;
+      const se = ltCache.stage_elapsed || 0;
+      const sd = ltCache.duration || 1;
+      $('#lt-timer').textContent = `第 ${idx} / ${tot} 級`;
+      $('#lt-timer-sub').textContent = ltCache.stage_wait
+        ? `間隔等待 ${ltCache.stage_wait}s`
+        : `${se} / ${sd} s`;
+      const done = ((idx - 1) + Math.min(1, se / sd)) / tot;
+      $('#lt-bar').style.width = `${Math.min(100, done * 100).toFixed(1)}%`;
+    } else {
+      $('#lt-timer').textContent = `${ltCache.elapsed} / ${ltCache.duration} s`;
+      $('#lt-timer-sub').textContent = `剩餘 ${ltCache.remaining} s`;
+      $('#lt-bar').style.width = `${ltCache.progress}%`;
+    }
   } else if (state === 'idle') {
     $('#lt-timer').textContent = '—';
     $('#lt-timer-sub').textContent = '';
@@ -841,6 +868,7 @@ function renderLoadtest(lt) {
 // 每秒在前端推算秒數，不必等 5 秒輪詢
 setInterval(() => {
   if (!ltCache || ltCache.state !== 'running' || !ltCache.started_ts) return;
+  if (ltCache.mode === 'stepped') return;
   const duration = ltCache.duration || 0;
   const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - ltCache.started_ts));
   const shown = duration ? Math.min(elapsed, duration) : elapsed;

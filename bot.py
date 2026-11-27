@@ -25,6 +25,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from core import distribute as dist
+from core import stepped as stp
 from core import verify as vfy
 from core.stats import compute_stats, judge
 
@@ -49,7 +50,7 @@ STAFF_IDS = {
 }
 GUILD_ID = os.getenv("GUILD_ID")
 
-RUNNING = {"active": False, "proc": None, "started": None, "label": ""}
+RUNNING = {"active": False, "proc": None, "started": None, "label": "", "stop": False}
 
 # 執行狀態檔：網頁控制台靠它顯示「正在壓測 xxx，30/60s」
 STATUS_FILE = RESULTS_DIR / "loadtest-status.json"
@@ -156,12 +157,14 @@ def plan_path(name: str) -> Path | None:
 # ---------------------------------------------------------------- 執行流程
 async def execute_test(channel, key: str, target: dict, chosen: list,
                        per_node: int, actual_total: int, duration: int,
-                       operator: str, override: bool, extra: dict = None) -> None:
+                       operator: str, override: bool, extra: dict = None,
+                       plan: str = None) -> None:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     jtl = RESULTS_DIR / f"{key}-{ts}.jtl"
     report = RESULTS_DIR / f"{key}-{ts}-report"
+    plan_name = plan or target["plan"]
     cmd = dist.build_command(
-        JMETER_BIN, plan_path(target["plan"]), chosen, per_node,
+        JMETER_BIN, plan_path(plan_name), chosen, per_node,
         duration, target["domain"], jtl, report, extra=extra,
     )
 
@@ -179,7 +182,7 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
         "key": key,
         "domain": target["domain"],
         "client": target.get("client", ""),
-        "plan": target.get("plan", ""),
+        "plan": plan_name,
         "threads": actual_total,
         "per_node": per_node,
         "nodes": [k for k, _ in chosen],
@@ -841,7 +844,6 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
     target.update(
         domain=host,
         client=target.get("client") or "即時壓測",
-        plan="oneshot.jmx",
         status="approved",
         token=target.get("token", ""),
         submitted_by=target.get("submitted_by") or str(interaction.user),
@@ -857,6 +859,10 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
         last_port=port,
         last_method=method,
     )
+    # 既有目標已設定專屬計畫（如 moodle.jmx）時不要被一句話壓測覆寫，
+    # 否則之後的 /loadtest 會退化成只打單一 URL 的通用計畫。
+    if not target.get("plan"):
+        target["plan"] = "oneshot.jmx"
     save_targets(data)
     audit("START", str(interaction.user),
           f"{key} {protocol}://{host}:{port}{path} {threads}x{duration}s {method}")
@@ -872,19 +878,401 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
         interaction.channel, key, target, chosen, per_node, actual,
         duration, str(interaction.user), False,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
+        plan="oneshot.jmx",
     )
 
 
-@tree.command(name="abort", description="中止正在執行的壓測")
+# ---------------------------------------------------------------- 階梯壓測
+async def execute_stepped(channel, key: str, target: dict, stages: list[int],
+                          duration: int, gap: int, operator: str,
+                          url: str, extra: dict,
+                          plan: str = "oneshot.jmx") -> None:
+    """逐級加壓，找出容量拐點。
+
+    每級都是一次完整的分散式壓測；級與級之間留 gap 秒，讓 WAF 速率限制
+    與源站有時間恢復，否則後段量到的全是 403，看不到源站真實行為。
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = f"{key}-{ts}-stepped"
+    total_stages = len(stages)
+    started = datetime.now()
+    started_ts = started.timestamp()
+    rows: list[dict] = []
+    nodes_used: list[str] = []
+
+    RUNNING.update(active=True, proc=None, started=started, label=key, stop=False)
+    audit("STEPPED", operator,
+          f"{key} domain={target['domain']} stages={','.join(map(str, stages))} "
+          f"duration={duration}s gap={gap}s plan={plan}")
+
+    header = discord.Embed(
+        title=f"階梯壓測 · {key}",
+        description=(f"目標 `{target['domain']}`\n"
+                     f"各級併發 **{' → '.join(map(str, stages))}**\n"
+                     f"每級 {duration}s · 級間間隔 {gap}s · 預計 "
+                     f"{total_stages * duration + (total_stages - 1) * gap}s"),
+        colour=0x378ADD,
+    )
+    header.set_footer(text=f"操作者 {operator} · /abort 可中止整場")
+    msg = await channel.send(embed=header)
+
+    def stage_embed(idx: int, threads: int, per_node: int, node_list: list,
+                    state_text: str, counts: int = 0,
+                    elapsed: int = 0) -> discord.Embed:
+        e = discord.Embed(
+            title=f"階梯壓測 · 第 {idx}/{total_stages} 級 · {threads} 併發",
+            description=(f"目標 `{target['domain']}`\n{state_text}\n"
+                         f"節點：{', '.join(node_list)}（每節點 {per_node} 執行緒）"),
+            colour=0xEF9F27,
+        )
+        e.add_field(name="已送回結果", value=f"{counts:,}", inline=True)
+        e.add_field(name="已執行", value=f"{elapsed}s / {duration}s", inline=True)
+        done = "\n".join(
+            f"{r['threads']} 併發 · {r['err_pct']:.2f}% 錯誤 · {r['ok_rps']:.1f} req/s"
+            for r in rows if r.get("total")
+        )
+        if done:
+            e.add_field(name="已完成級別", value=done, inline=False)
+        return e
+
+    for idx, threads in enumerate(stages, 1):
+        if RUNNING.get("stop"):
+            break
+
+        nodes = load_nodes()
+        chosen, per_node, actual = dist.allocate(threads, nodes)
+        if not chosen:
+            rows.append({
+                "threads": threads, "total": 0, "ok": 0, "errors": 0,
+                "err_pct": 0.0, "rps": 0.0, "ok_rps": 0.0, "avg_ms": 0.0,
+                "p50_ms": 0, "p90_ms": 0, "p99_ms": 0, "max_ms": 0,
+                "healthy": False,
+                "note": f"節點容量不足（有效容量 {dist.effective_capacity(nodes)}）",
+            })
+            audit("STEPPED-SKIP", operator, f"{key} {threads} 併發：容量不足")
+            continue
+
+        node_list = [k for k, _ in chosen]
+        for name in node_list:
+            if name not in nodes_used:
+                nodes_used.append(name)
+
+        stem = f"{run_id}-s{idx}-{actual}t"
+        jtl = RESULTS_DIR / f"{stem}.jtl"
+        report = RESULTS_DIR / f"{stem}-report"
+        jlog = RESULTS_DIR / f"{stem}-jmeter.log"
+        cmd = dist.build_command(
+            JMETER_BIN, plan_path(plan), chosen, per_node,
+            duration, target["domain"], jtl, report, extra=extra,
+        )
+
+        base = {
+            "key": key, "domain": target["domain"],
+            "client": target.get("client", ""), "plan": plan,
+            "threads": actual, "per_node": per_node, "nodes": node_list,
+            "duration": duration, "started_ts": started_ts,
+            "operator": operator, "override": False,
+            "mode": "stepped", "stage_index": idx,
+            "stage_total": total_stages, "stages": stages,
+        }
+        write_status("running", elapsed=0, requests=0, stage_elapsed=0,
+                     stage_threads=actual, **base)
+
+        state = {"count": 0}
+        stage_start = datetime.now()
+        await msg.edit(embed=stage_embed(idx, actual, per_node, node_list, "加壓中…"))
+
+        async def on_progress(count: int) -> None:
+            elapsed = int((datetime.now() - started).total_seconds())
+            stage_elapsed = int((datetime.now() - stage_start).total_seconds())
+            state["count"] = count
+            write_status("running", elapsed=elapsed, requests=count,
+                         stage_elapsed=stage_elapsed, stage_threads=actual, **base)
+            try:
+                await msg.edit(embed=stage_embed(
+                    idx, actual, per_node, node_list, "加壓中…", count, elapsed))
+            except discord.HTTPException:
+                pass
+
+        def register_proc(proc) -> None:
+            RUNNING["proc"] = proc
+
+        try:
+            rc = await dist.run_distributed(
+                cmd, jtl, PLANS_DIR, on_progress, poll=5,
+                log_path=jlog, deadline=time.time() + duration + 180,
+                on_start=register_proc,
+            )
+        except FileNotFoundError:
+            RUNNING.update(active=False, proc=None)
+            audit("ERROR", operator, "JMeter 不存在")
+            write_status("failed", elapsed=0, requests=0,
+                         error="找不到 JMeter", **base)
+            await channel.send(f"找不到 JMeter：`{JMETER_BIN}`")
+            return
+        finally:
+            RUNNING["proc"] = None
+
+        if not jtl.exists():
+            rows.append({
+                "threads": actual, "total": 0, "ok": 0, "errors": 0,
+                "err_pct": 0.0, "rps": 0.0, "ok_rps": 0.0, "avg_ms": 0.0,
+                "p50_ms": 0, "p90_ms": 0, "p99_ms": 0, "max_ms": 0,
+                "healthy": False, "note": f"未產生結果檔（rc={rc}）",
+            })
+            audit("STEPPED-FAIL", operator, f"{key} {actual} 併發無 jtl rc={rc}")
+            continue
+
+        row = stp.stage_metrics(actual, duration, compute_stats(jtl))
+        row["stem"] = stem
+        rows.append(row)
+        write_meta(stem, {
+            **base,
+            "total": row["total"], "err_pct": row["err_pct"],
+            "avg_ms": row["avg_ms"], "p50_ms": row["p50_ms"],
+            "p90_ms": row["p90_ms"], "p99_ms": row["p99_ms"],
+            "ok": row["healthy"],
+            "ended_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        audit("STEPPED-STAGE", operator,
+              f"{key} {actual} 併發 total={row['total']} "
+              f"err={row['err_pct']:.2f}% ok_rps={row['ok_rps']}")
+
+        await msg.edit(embed=stage_embed(
+            idx, actual, per_node, node_list,
+            f"本級完成 · 錯誤 {row['err_pct']:.2f}% · 成功 {row['ok_rps']:.1f} req/s",
+            row["total"], duration))
+
+        if idx < total_stages and not RUNNING.get("stop"):
+            for left in range(gap, 0, -1):
+                if RUNNING.get("stop"):
+                    break
+                write_status("running", elapsed=duration, requests=0,
+                             stage_elapsed=duration, stage_wait=left,
+                             stage_threads=actual, **base)
+                try:
+                    await msg.edit(embed=stage_embed(
+                        idx, actual, per_node, node_list,
+                        f"間隔等待 {left}s（讓 WAF 限流重置）…",
+                        row["total"], duration))
+                except discord.HTTPException:
+                    pass
+                await asyncio.sleep(1)
+
+    RUNNING.update(active=False, proc=None, stop=False)
+
+    if not rows:
+        write_status("failed", elapsed=0, requests=0, error="未取得任何結果",
+                     key=key, domain=target["domain"], mode="stepped")
+        await channel.send("階梯壓測未取得任何結果。")
+        return
+
+    summary = stp.analyze(rows)
+    verdict = stp.verdict_text(rows, summary)
+    meta = {
+        "key": key, "domain": target["domain"], "client": target.get("client", ""),
+        "plan": plan, "mode": "stepped", "url": url, "stages": stages,
+        "duration": duration, "gap": gap, "nodes": nodes_used,
+        "operator": operator,
+        "started_at": started.isoformat(timespec="seconds"),
+        "summary": summary,
+    }
+
+    html_path = RESULTS_DIR / f"{run_id}.html"
+    try:
+        html_path.write_text(stp.render_html(meta, rows, summary), encoding="utf-8")
+    except Exception as exc:
+        audit("ERROR", operator, f"階梯報告產生失敗：{exc}")
+        html_path = None
+    (RESULTS_DIR / f"{run_id}.json").write_text(
+        json.dumps({**meta, "rows": rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    total_req = sum(r["total"] for r in rows)
+    total_err = sum(r["errors"] for r in rows)
+    err_all = (total_err / total_req * 100) if total_req else 0.0
+
+    final = discord.Embed(
+        title=f"階梯壓測完成 · {key}",
+        description=(f"目標 `{target['domain']}` · {total_stages} 級 · "
+                     f"共 {total_req:,} 請求 · 整體錯誤 {err_all:.2f}%"),
+        colour=0x639922 if summary.get("knee_threads") else 0xE24B4A,
+    )
+    for r in rows:
+        if not r.get("total"):
+            final.add_field(name=f"{r['threads']} 併發",
+                            value=f"未取得結果（{r.get('note', '')}）", inline=False)
+            continue
+        final.add_field(
+            name=f"{r['threads']} 併發 · {'健康' if r['healthy'] else '不健康'}",
+            value=(f"{r['ok_rps']:.1f} req/s 成功 · 錯誤 {r['err_pct']:.2f}% · "
+                   f"P90 {r['p90_ms']}ms"),
+            inline=False,
+        )
+    final.add_field(name="結論", value=verdict, inline=False)
+    final.add_field(
+        name="容量",
+        value=(f"拐點 {summary.get('knee_threads') or '—'} 併發 · "
+               f"峰值成功吞吐 {summary.get('best_ok_rps') or 0:.1f} req/s"),
+        inline=False,
+    )
+    if html_path:
+        final.set_footer(text=f"報告 {html_path.name}")
+    await channel.send(embed=final)
+
+    write_status("done", elapsed=int((datetime.now() - started).total_seconds()),
+                 requests=total_req, ok=bool(summary.get("knee_threads")),
+                 err_pct=round(err_all, 2), mode="stepped",
+                 key=key, domain=target["domain"], stages=stages,
+                 stage_total=total_stages, stage_index=total_stages,
+                 nodes=nodes_used, operator=operator,
+                 started_ts=started_ts, duration=duration,
+                 knee_threads=summary.get("knee_threads"),
+                 best_ok_rps=summary.get("best_ok_rps"),
+                 report=html_path.name if html_path else "")
+    audit("STEPPED-DONE", operator,
+          f"{key} 拐點={summary.get('knee_threads')} "
+          f"峰值成功吞吐={summary.get('best_ok_rps')} req/s")
+
+
+@tree.command(name="stepped",
+              description="階梯壓測：逐級加壓找出容量拐點（OWNER 與網站授權的管理員）")
+@app_commands.describe(
+    url="完整網址，例 https://example.com/login/index.php",
+    stages="各級併發，逗號分隔且遞增，例 50,100,200,400",
+    duration="每級持續秒數，預設 60",
+    gap="級間間隔秒數，預設 60（讓 WAF 限流重置）",
+    mode="協定與方法，例 https-get / https-post / http-get",
+)
+async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
+                      duration: int = 60, gap: int = 60, mode: str = "https-get"):
+    uid = interaction.user.id
+    if not is_admin(uid):
+        await interaction.response.send_message(
+            "你沒有權限。只有 OWNER 與網站授權的管理員可以發起壓測。", ephemeral=True)
+        audit("DENY-STEPPED", str(interaction.user), f"{url} {stages}")
+        return
+
+    try:
+        protocol, method = parse_mode(mode)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    try:
+        stage_list = stp.parse_stages(stages)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    raw = url.strip()
+    if "://" not in raw:
+        raw = f"{protocol}://{raw}"
+    parsed = urlparse(raw)
+    host = parsed.hostname or ""
+    if not host or "." not in host:
+        await interaction.response.send_message(
+            f"網址無法解析：`{url}`\n請用完整格式，例 `https://example.com/login/index.php`",
+            ephemeral=True)
+        return
+    if parsed.scheme in ("http", "https"):
+        protocol = parsed.scheme
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    port = parsed.port or (443 if protocol == "https" else 80)
+
+    data = load_targets()
+    limits = data.get("limits", {})
+    max_threads = int(limits.get("global_max_threads", 5000))
+    max_duration = int(limits.get("global_max_duration", 1800))
+
+    peak = stage_list[-1]
+    if peak > max_threads:
+        await interaction.response.send_message(
+            f"最高一級 {peak} 併發超過全域上限 {max_threads}。", ephemeral=True)
+        return
+    if not 5 <= duration <= max_duration:
+        await interaction.response.send_message(
+            f"每級時長須介於 5 ~ {max_duration} 秒。", ephemeral=True)
+        return
+    if not 0 <= gap <= 600:
+        await interaction.response.send_message(
+            "級間間隔須介於 0 ~ 600 秒。", ephemeral=True)
+        return
+    if RUNNING["active"]:
+        await interaction.response.send_message(
+            "已有測試在執行中，請先 `/abort`。", ephemeral=True)
+        return
+
+    nodes = load_nodes()
+    chosen, per_node, actual = dist.allocate(peak, nodes)
+    if not chosen:
+        await interaction.response.send_message(
+            f"節點容量不足：最高一級需要 {peak} 併發，目前有效容量 "
+            f"{dist.effective_capacity(nodes)}。", ephemeral=True)
+        return
+
+    key = make_key(host)
+    now = datetime.now().isoformat(timespec="seconds")
+    target = data.setdefault("targets", {}).setdefault(key, {})
+    target.update(
+        domain=host,
+        client=target.get("client") or "階梯壓測",
+        status="approved",
+        token=target.get("token", ""),
+        submitted_by=target.get("submitted_by") or str(interaction.user),
+        submitted_at=target.get("submitted_at") or now,
+        verified_at=target.get("verified_at"),
+        verification=target.get("verification") or "admin_start",
+        approved_by=str(interaction.user),
+        approved_at=now,
+        max_threads=max(int(target.get("max_threads") or 0), peak),
+        max_duration=max(int(target.get("max_duration") or 0), duration),
+        authorized_until=(datetime.now() + timedelta(days=1)).date().isoformat(),
+        last_url=raw,
+        last_port=port,
+        last_method=method,
+    )
+    if not target.get("plan"):
+        target["plan"] = "oneshot.jmx"
+    save_targets(data)
+
+    total_secs = len(stage_list) * duration + (len(stage_list) - 1) * gap
+    audit("STEPPED-START", str(interaction.user),
+          f"{key} {protocol}://{host}:{port}{path} stages={stages} "
+          f"{duration}s gap={gap}s {method}")
+
+    await interaction.response.defer()
+    await interaction.followup.send(
+        f"**開始階梯壓測** · `{protocol}://{host}:{port}{path}`\n"
+        f"{method} · 各級 **{' → '.join(map(str, stage_list))}** 併發\n"
+        f"每級 {duration}s · 間隔 {gap}s · 預計 {total_secs}s\n"
+        f"操作者 {interaction.user.mention}"
+    )
+    await execute_stepped(
+        interaction.channel, key, target, stage_list, duration, gap,
+        str(interaction.user), url=raw,
+        extra={"protocol": protocol, "port": port, "path": path, "method": method},
+    )
+
+
+@tree.command(name="abort", description="中止正在執行的壓測（階梯壓測會中止整場）")
 async def abort(interaction: discord.Interaction):
     if not is_staff(interaction.user.id):
         await interaction.response.send_message("你沒有使用權限。", ephemeral=True)
         return
-    proc = RUNNING.get("proc")
-    if not RUNNING["active"] or proc is None:
+    if not RUNNING["active"]:
         await interaction.response.send_message("目前沒有執行中的測試。", ephemeral=True)
         return
-    proc.kill()
+    RUNNING["stop"] = True
+    proc = RUNNING.get("proc")
+    if proc is not None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
     RUNNING.update(active=False, proc=None)
     audit("ABORT", str(interaction.user), "手動中止")
     patch_status(state="aborted", error="手動中止", updated_by=str(interaction.user))
