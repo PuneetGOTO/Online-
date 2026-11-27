@@ -202,6 +202,118 @@ def get_cred(key: str) -> Optional[dict]:
         return None
 
 
+# ---------------------------------------------------------------- Discord 設定
+
+ENV_FILE = PROJECT_DIR / ".env"
+BOT_UNIT = "loadtest-bot"
+BOT_LOG = PROJECT_DIR / "logs" / "bot.log"
+
+SLASH_COMMANDS = [
+    ("/target add", "提交壓測目標，產生所有權驗證 token"),
+    ("/target verify", "驗證目標的域名所有權"),
+    ("/target approve", "OWNER 核准目標並設定併發上限"),
+    ("/target suspend", "OWNER 立即暫停目標"),
+    ("/target list", "列出所有目標與授權狀態"),
+    ("/loadtest", "對已核准目標發起分散式壓測"),
+    ("/nodes", "檢查各節點連線狀態"),
+    ("/abort", "中止正在執行的壓測"),
+]
+
+
+def read_env() -> dict:
+    data: dict[str, str] = {}
+    if not ENV_FILE.exists():
+        return data
+    for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        key, _, value = text.partition("=")
+        data[key.strip()] = value.strip()
+    return data
+
+
+def write_env(updates: dict) -> None:
+    """只更新指定鍵，保留註解與原有順序。"""
+    lines = []
+    if ENV_FILE.exists():
+        lines = ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    seen = set()
+    output = []
+    for line in lines:
+        text = line.strip()
+        if text and not text.startswith("#") and "=" in text:
+            key = text.partition("=")[0].strip()
+            if key in updates:
+                output.append(f"{key}={updates[key]}")
+                seen.add(key)
+                continue
+        output.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            output.append(f"{key}={value}")
+    ENV_FILE.write_text("\n".join(output).rstrip("\n") + "\n", encoding="utf-8")
+    try:
+        ENV_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def mask_secret(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "已設定"
+    return f"{value[:6]}…{value[-4:]}"
+
+
+def systemctl_bot(action: str) -> tuple[int, str]:
+    if action in ("start", "stop", "restart"):
+        cmd = ["sudo", "-n", "systemctl", action, BOT_UNIT]
+    else:
+        cmd = ["systemctl", action, BOT_UNIT]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+    except FileNotFoundError:
+        return 127, "systemctl 不存在"
+    except Exception as exc:
+        return 1, str(exc)
+    text = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip()
+    return proc.returncode, text
+
+
+def tail_log(path: Path, lines: int = 25) -> str:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - 8192))
+            data = handle.read().decode("utf-8", "replace")
+        return "\n".join(data.splitlines()[-lines:])
+    except Exception:
+        return ""
+
+
+def bot_status() -> dict:
+    env = read_env()
+    token = env.get("DISCORD_TOKEN", "").strip()
+    _rc, state = systemctl_bot("is-active")
+    service = (state.splitlines()[0].strip() if state else "") or "unknown"
+    if service not in ("active", "inactive", "failed", "activating", "deactivating", "unknown"):
+        service = "unknown"
+    return {
+        "service": service,
+        "configured": bool(token),
+        "token_hint": mask_secret(token),
+        "owner_id": env.get("OWNER_ID", ""),
+        "staff_ids": env.get("STAFF_IDS", ""),
+        "guild_id": env.get("GUILD_ID", ""),
+        "log": tail_log(BOT_LOG, 25),
+        "commands": [{"cmd": c, "desc": d} for c, d in SLASH_COMMANDS],
+    }
+
+
 def _run_text(cmd: list[str], timeout: float = 10) -> str:
     """執行指令並以容錯方式解碼（Windows 中文主機常回 GBK）。"""
     try:
@@ -800,6 +912,7 @@ async def get_state(_=Depends(require_auth)):
         },
         "nodes": items,
         "job": job.summary() if job else None,
+        "bot": await asyncio.to_thread(bot_status),
     }
 
 
@@ -1002,6 +1115,88 @@ async def ssh_test(body: SshTestBody, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="請輸入伺服器密碼")
 
     return await asyncio.to_thread(_ssh_probe_blocking, host, body.ssh_port, user, password)
+
+
+class BotConfigBody(BaseModel):
+    token: Optional[str] = None
+    owner_id: str = ""
+    staff_ids: str = ""
+    guild_id: str = ""
+
+
+class BotActionBody(BaseModel):
+    action: str
+
+
+@app.get("/api/bot/status")
+async def get_bot_status(_=Depends(require_auth)):
+    return await asyncio.to_thread(bot_status)
+
+
+@app.post("/api/bot/config")
+async def save_bot_config(body: BotConfigBody, request: Request, _=Depends(require_auth)):
+    owner = body.owner_id.strip()
+    guild = body.guild_id.strip()
+    if owner and not owner.isdigit():
+        raise HTTPException(status_code=400, detail="Owner ID 必須是數字")
+    if guild and not guild.isdigit():
+        raise HTTPException(status_code=400, detail="Guild ID 必須是數字")
+
+    staff = body.staff_ids.replace(",", " ").split()
+    for item in staff:
+        if not item.isdigit():
+            raise HTTPException(status_code=400, detail="Staff IDs 只能是數字，以逗號分隔")
+
+    updates = {
+        "OWNER_ID": owner,
+        "STAFF_IDS": ",".join(staff),
+        "GUILD_ID": guild,
+    }
+    token = (body.token or "").strip()
+    if token:
+        if len(token) < 50:
+            raise HTTPException(status_code=400, detail="Token 長度不正確，請確認複製完整")
+        updates["DISCORD_TOKEN"] = token
+
+    await asyncio.to_thread(write_env, updates)
+    audit("BOT-CONFIG", request.client.host if request.client else "-",
+          f"token={'updated' if token else 'kept'} owner={owner} staff={len(staff)}")
+
+    status = await asyncio.to_thread(bot_status)
+    restarted = False
+    if status["service"] == "active":
+        await asyncio.to_thread(systemctl_bot, "restart")
+        await asyncio.sleep(2.5)
+        status = await asyncio.to_thread(bot_status)
+        restarted = True
+    return {"ok": True, "restarted": restarted, "bot": status}
+
+
+@app.post("/api/bot/action")
+async def bot_action(body: BotActionBody, request: Request, _=Depends(require_auth)):
+    action = body.action
+    if action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=400, detail="action 只能是 start / stop / restart")
+
+    env = await asyncio.to_thread(read_env)
+    if action in ("start", "restart"):
+        if not env.get("DISCORD_TOKEN", "").strip():
+            raise HTTPException(status_code=400, detail="尚未填寫 Bot Token")
+        if not env.get("OWNER_ID", "").strip():
+            raise HTTPException(status_code=400, detail="尚未填寫 Owner ID")
+
+    rc, out = await asyncio.to_thread(systemctl_bot, action)
+    if rc != 0:
+        audit("BOT-FAIL", request.client.host if request.client else "-", f"{action} {out[:120]}")
+        hint = out or "未知錯誤"
+        if "password is required" in out or "not allowed" in out:
+            hint = "沒有啟停服務的權限（缺少 sudoers 規則），請重跑 setup-master.sh"
+        raise HTTPException(status_code=500, detail=f"systemctl {action} 失敗：{hint}")
+
+    await asyncio.sleep(2.5)
+    status = await asyncio.to_thread(bot_status)
+    audit("BOT-" + action.upper(), request.client.host if request.client else "-", status["service"])
+    return {"ok": True, "action": action, "bot": status}
 
 
 @app.get("/api/nodes/{key}/inspect")

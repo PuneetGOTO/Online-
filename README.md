@@ -89,6 +89,7 @@ flowchart LR
 - 網頁上直接新增／編輯／刪除節點，填 IP、SSH 帳密即可
 - 測試連接會實際登入 SSH 並回報 OS／CPU／記憶體／sudo／JMeter 狀態
 - 測試通過後一鍵部署，一台新機器從填表到上線不用離開瀏覽器
+- 網頁直接填 Discord Token／Owner／Staff／Guild 並啟停 Bot，附即時日誌
 - 一鍵部署全部節點，或單台重裝；部署輸出即時串流到頁面
 - 節點啟停用開關直接改寫 `config/nodes.json`，容量即時重算
 
@@ -241,6 +242,8 @@ GUILD_ID=<步驟 1.3 的伺服器 ID>
 | `SSH_USER` | 否 | 控制台部署節點時使用的 SSH 帳號，預設 `root` |
 | `MASTER_IP` | 否 | 主服務器對外 IP，留空自動偵測 |
 
+> 也可以完全不碰 `.env`：部署完成後開控制台，在「Discord 機器人」面板填寫這四項並按「啟動」。
+
 啟動服務：
 
 ```bash
@@ -382,6 +385,7 @@ WEB_TOKEN=你的權杖 .venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --
 | 節點卡 | 狀態燈、延遲、執行緒上限、最近檢查時間、延遲走勢圖、啟停用開關 |
 | 節點卡按鈕 | 「檢查」讀取遠端服務狀態／監聽埠／硬體／負載；「部署」重裝該節點；主機列右側鉛筆／垃圾桶可編輯或刪除 |
 | 一鍵部署 | 對所有啟用節點依序執行 `setup-node.sh`，可勾選含停用節點 |
+| Discord 面板 | 在網頁填 Token／Owner／Staff／Guild，直接啟動、重啟、停止 Bot，並顯示即時日誌與斜線指令清單 |
 | 部署輸出 | 即時串流 SSH 輸出，錯誤行標紅，可中止 |
 
 ### 新增伺服器
@@ -416,6 +420,33 @@ WEB_TOKEN=你的權杖 .venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --
 **密碼怎麼存**：以 `WEB_TOKEN` 派生金鑰加密後寫入 `config/credentials.json`（權限 600，已列入 `.gitignore`）。拿到檔案但沒有權杖無法解開；換掉 `WEB_TOKEN` 會讓既有密碼失效，需要重新輸入一次。
 
 > 網址帶 `#add` 會直接開啟新增表單，方便加到書籤。
+
+### Discord 機器人
+
+不需要 SSH 進去改 `.env`，控制台下方就有一塊 Discord 面板：
+
+| 欄位 | 說明 |
+|---|---|
+| Bot Token | Discord Developer Portal → Bot → Reset Token。已設定過會顯示 `MTIzND…ABCD` 這種遮罩，**留空則不變更** |
+| Owner ID | 你的 Discord 使用者 ID，唯一能核准壓測的人 |
+| Guild ID | 填了斜線指令**立即生效**；不填要等全域同步（最多 1 小時） |
+| Staff IDs | 安全人員 ID，逗號分隔，可留空 |
+
+按「儲存設定」會寫回 `.env`；如果 Bot 正在執行，會自動重啟讓新設定生效。
+
+右上三個按鈕：
+
+- **啟動**：`systemctl start loadtest-bot`。沒填 Token 或 Owner ID 會直接被拒
+- **重啟**：改完設定但沒自動重啟時用
+- **停止**：`systemctl stop loadtest-bot`
+
+面板底部會顯示 `logs/bot.log` 最後 25 行。啟動失敗（例如 Token 貼錯）時，這裡會直接看到 `discord.errors.LoginFailure: Improper token has been passed.`，不用再去翻 journalctl。
+
+狀態標籤對應：`執行中` / `已停止` / `啟動失敗` / `未設定`。
+
+> Bot 以斜線指令（`/`）操作，不支援舊式前綴指令。指令清單見面板右側，或 [指令一覽](#指令一覽)。
+
+**Token 不會回傳給瀏覽器**：介面只顯示遮罩後的片段，存檔時留空即沿用原值。
 
 ### 在線判定方式
 
@@ -468,6 +499,9 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 | `DELETE` | `/api/nodes/{key}` | 刪除節點（同時清除已存憑證） |
 | `POST` | `/api/ssh-test` | 用帳密實際登入 SSH，回報 OS／CPU／記憶體／sudo／JMeter 狀態 |
 | `POST` | `/api/probe` | 探測任意主機的 RMI / SSH 埠（純 TCP，不需帳密） |
+| `GET` | `/api/bot/status` | Bot 服務狀態、設定摘要（Token 遮罩）、日誌尾段、指令清單 |
+| `POST` | `/api/bot/config` | 寫入 Token／Owner／Staff／Guild 到 `.env`，執行中會自動重啟 |
+| `POST` | `/api/bot/action` | `start` / `stop` / `restart` Bot 服務 |
 | `POST` | `/api/nodes/{key}/enabled` | 啟用／停用節點，寫回 `nodes.json` |
 | `GET` | `/api/nodes/{key}/inspect` | SSH 讀取節點詳細狀態 |
 | `POST` | `/api/deploy` | 發起部署（`scope: all` 或 `node`） |
@@ -644,6 +678,9 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 | 部署報 `sudo: a password is required` | 節點 sudo 需要密碼 | 節點加 `NOPASSWD`，或把 `SSH_USER` 設為 `root` |
 | 控制台無法登入 | `WEB_TOKEN` 不符 | 看 `/opt/loadtest-platform/.env` 的 `WEB_TOKEN` |
 | 控制台 502 / 連不上 | 服務未啟動或防火牆 | `systemctl status loadtest-web`、`ufw status` |
+| 網頁按「啟動」報權限不足 | 缺少 sudoers 規則 | 重跑 `setup-master.sh`，或檢查 `/etc/sudoers.d/loadtest-web` |
+| Bot 顯示「啟動失敗」 | Token 錯誤或已被重置 | 看面板日誌，重新產生 Token 並貼上 |
+| Bot 啟動後馬上停止 | `OWNER_ID` 為空或格式錯 | 填數字 ID，不是使用者名稱 |
 
 **查看日誌**
 

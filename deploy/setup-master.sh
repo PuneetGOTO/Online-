@@ -146,6 +146,9 @@ cat > /etc/systemd/system/loadtest-bot.service <<EOF
 Description=Load Test Platform · Discord Control Plane
 After=network-online.target
 Wants=network-online.target
+# Token 錯誤時不要無限重啟：5 分鐘內失敗 5 次就停下
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -153,8 +156,8 @@ User=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/bot.py
-Restart=always
-RestartSec=5
+Restart=on-failure
+RestartSec=10
 StandardOutput=append:${INSTALL_DIR}/logs/bot.log
 StandardError=append:${INSTALL_DIR}/logs/bot.log
 
@@ -190,6 +193,20 @@ EOF
 systemctl daemon-reload
 systemctl enable loadtest-web >/dev/null
 c_ok "服務已註冊（loadtest-web）"
+
+# ---------------------------------------------------------------- 6.5 Web 啟停 Bot 的權限
+SYSTEMCTL_BIN="$(command -v systemctl || echo /usr/bin/systemctl)"
+cat > /etc/sudoers.d/loadtest-web <<EOF
+# 允許 Web 控制台啟停 Discord Bot（僅限這三個動作，其餘一律拒絕）
+${SERVICE_USER} ALL=(root) NOPASSWD: ${SYSTEMCTL_BIN} start loadtest-bot, ${SYSTEMCTL_BIN} stop loadtest-bot, ${SYSTEMCTL_BIN} restart loadtest-bot
+EOF
+chmod 440 /etc/sudoers.d/loadtest-web
+if visudo -c -f /etc/sudoers.d/loadtest-web >/dev/null 2>&1; then
+  c_ok "已授權 Web 控制台啟停 loadtest-bot"
+else
+  rm -f /etc/sudoers.d/loadtest-web
+  c_warn "sudoers 規則語法錯誤，已移除（Web 控制台將無法啟停 Bot）"
+fi
 
 # ---------------------------------------------------------------- 7. 防火牆
 ufw allow "${RMI_PORT}/tcp" comment 'jmeter master rmi' >/dev/null 2>&1 || true

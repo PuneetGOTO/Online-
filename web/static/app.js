@@ -120,6 +120,7 @@ function renderState(state) {
   }
 
   renderNodes(nodes, job);
+  renderBot(state.bot);
   if (job) renderJobChip(job);
 }
 
@@ -584,6 +585,124 @@ function appendLine(line) {
   if (log.querySelector('.log-empty')) log.innerHTML = '';
   log.insertAdjacentHTML('beforeend', lineHtml(line));
   log.scrollTop = log.scrollHeight;
+}
+
+/* ---------------------------------------------------------------- Discord */
+
+const botForm = $('#bot-form');
+let botFormDirty = false;
+let botCmdsRendered = false;
+
+['token', 'owner_id', 'staff_ids', 'guild_id'].forEach((name) => {
+  botForm[name].addEventListener('input', () => {
+    botFormDirty = true;
+  });
+});
+
+botForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  setBotStatus('儲存中…', 'busy');
+  try {
+    const result = await api('/api/bot/config', {
+      method: 'POST',
+      body: JSON.stringify({
+        token: botForm.token.value.trim(),
+        owner_id: botForm.owner_id.value.trim(),
+        staff_ids: botForm.staff_ids.value.trim(),
+        guild_id: botForm.guild_id.value.trim(),
+      }),
+    });
+    botFormDirty = false;
+    botForm.token.value = '';
+    renderBot(result.bot);
+    setBotStatus(result.restarted ? '已儲存，服務已重啟' : '已儲存', 'ok');
+    refreshState();
+  } catch (err) {
+    setBotStatus(err.message, 'err');
+  }
+});
+
+$('#btn-bot-start').addEventListener('click', () => botAction('start'));
+$('#btn-bot-restart').addEventListener('click', () => botAction('restart'));
+$('#btn-bot-stop').addEventListener('click', () => {
+  if (!confirm('停止 Discord 機器人？停止後斜線指令不會有回應。')) return;
+  botAction('stop');
+});
+
+async function botAction(action) {
+  const label = { start: '啟動中…', stop: '停止中…', restart: '重啟中…' }[action] || '處理中…';
+  setBotStatus(label, 'busy');
+  ['#btn-bot-start', '#btn-bot-stop', '#btn-bot-restart'].forEach((sel) => {
+    $(sel).disabled = true;
+  });
+  try {
+    const result = await api('/api/bot/action', {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    });
+    renderBot(result.bot);
+    const ok = action === 'stop' ? result.bot.service !== 'active' : result.bot.service === 'active';
+    setBotStatus(
+      ok ? (action === 'stop' ? '已停止' : '已啟動') : '服務未持續執行，請看下方日誌',
+      ok ? 'ok' : 'err'
+    );
+    refreshState();
+  } catch (err) {
+    setBotStatus(err.message, 'err');
+  } finally {
+    ['#btn-bot-start', '#btn-bot-stop', '#btn-bot-restart'].forEach((sel) => {
+      $(sel).disabled = false;
+    });
+    if (latestState && latestState.bot) renderBot(latestState.bot);
+  }
+}
+
+function renderBot(bot) {
+  if (!bot) return;
+
+  const chip = $('#bot-chip');
+  const map = {
+    active: ['執行中', 'ok'],
+    activating: ['啟動中', 'run'],
+    deactivating: ['停止中', 'run'],
+    failed: ['啟動失敗', 'err'],
+    inactive: [bot.configured ? '已停止' : '未設定', bot.configured ? 'warn' : ''],
+  };
+  const entry = map[bot.service] || (bot.configured ? ['無法偵測', ''] : ['未設定', '']);
+  chip.textContent = entry[0];
+  chip.className = 'chip ' + entry[1];
+
+  $('#btn-bot-start').disabled = !bot.configured || bot.service === 'active';
+  $('#btn-bot-stop').disabled = bot.service !== 'active';
+  $('#btn-bot-restart').disabled = !bot.configured;
+
+  if (!botFormDirty) {
+    botForm.owner_id.value = bot.owner_id || '';
+    botForm.staff_ids.value = bot.staff_ids || '';
+    botForm.guild_id.value = bot.guild_id || '';
+    botForm.token.value = '';
+  }
+  botForm.token.placeholder = bot.configured
+    ? `已設定 ${bot.token_hint}，留空則不變更`
+    : '貼上 Discord Bot Token';
+
+  const log = $('#bot-log');
+  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.textContent = bot.log || '（尚無日誌）';
+  if (nearBottom) log.scrollTop = log.scrollHeight;
+
+  if (!botCmdsRendered && Array.isArray(bot.commands) && bot.commands.length) {
+    $('#bot-cmd-list').innerHTML = bot.commands
+      .map((item) => `<div class="cmd-item"><code>${esc(item.cmd)}</code><span>${esc(item.desc)}</span></div>`)
+      .join('');
+    botCmdsRendered = true;
+  }
+}
+
+function setBotStatus(text, cls) {
+  const element = $('#bot-status-text');
+  element.textContent = text;
+  element.className = 'form-status' + (cls ? ' ' + cls : '');
 }
 
 /* ---------------------------------------------------------------- 啟動 */
