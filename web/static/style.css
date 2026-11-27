@@ -494,6 +494,17 @@ main { max-width: 1180px; margin: 0 auto; padding: 22px 24px 64px; }
   white-space: nowrap;
 }
 .cmd-item span { color: var(--muted); }
+.bot-log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-soft);
+  font-size: 12px;
+  color: var(--muted);
+}
+.bot-log-head .spacer { flex: 1; }
 .bot-log {
   margin: 0;
   border-top: 1px solid var(--line);

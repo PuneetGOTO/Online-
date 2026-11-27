@@ -314,6 +314,49 @@ def bot_status() -> dict:
     }
 
 
+def _discord_me(token: str) -> dict:
+    """直接向 Discord 驗證 Token，回傳 Bot 身分或明確錯誤。"""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        "https://discord.com/api/v10/users/@me",
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "DiscordBot (loadtest-console, 1.0)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return {
+                "ok": True,
+                "username": data.get("username", ""),
+                "id": data.get("id", ""),
+                "error": "",
+            }
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return {"ok": False, "error": "Token 無效或已被重置（401）"}
+        if exc.code == 429:
+            return {"ok": False, "error": "請求過於頻繁，請稍後再試（429）"}
+        return {"ok": False, "error": f"Discord 回應 {exc.code}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"無法連線 Discord：{exc}"}
+
+
+def append_bot_log_marker(action: str) -> None:
+    """在日誌插入分隔線，避免舊的錯誤輸出被誤認為本次執行。"""
+    try:
+        BOT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(BOT_LOG, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n===== {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {action} =====\n"
+            )
+    except Exception:
+        pass
+
+
 def _run_text(cmd: list[str], timeout: float = 10) -> str:
     """執行指令並以容錯方式解碼（Windows 中文主機常回 GBK）。"""
     try:
@@ -1223,6 +1266,30 @@ async def save_bot_config(body: BotConfigBody, request: Request, _=Depends(requi
     return {"ok": True, "restarted": restarted, "bot": status}
 
 
+class BotTokenBody(BaseModel):
+    token: Optional[str] = None
+
+
+@app.post("/api/bot/test-token")
+async def test_bot_token(body: BotTokenBody, _=Depends(require_auth)):
+    token = (body.token or "").strip()
+    if not token:
+        token = (await asyncio.to_thread(read_env)).get("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="尚未填寫 Token")
+    return await asyncio.to_thread(_discord_me, token)
+
+
+@app.post("/api/bot/clear-log")
+async def clear_bot_log(_=Depends(require_auth)):
+    try:
+        BOT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        BOT_LOG.write_text("", encoding="utf-8")
+    except PermissionError:
+        raise HTTPException(status_code=500, detail="沒有寫入日誌的權限")
+    return {"ok": True}
+
+
 @app.post("/api/bot/action")
 async def bot_action(body: BotActionBody, request: Request, _=Depends(require_auth)):
     action = body.action
@@ -1235,6 +1302,7 @@ async def bot_action(body: BotActionBody, request: Request, _=Depends(require_au
             raise HTTPException(status_code=400, detail="尚未填寫 Bot Token")
         if not env.get("OWNER_ID", "").strip():
             raise HTTPException(status_code=400, detail="尚未填寫 Owner ID")
+        await asyncio.to_thread(append_bot_log_marker, action)
 
     rc, out = await asyncio.to_thread(systemctl_bot, action)
     if rc != 0:

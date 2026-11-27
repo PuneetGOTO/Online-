@@ -117,6 +117,7 @@
           </label>
           <div class="bot-actions span2">
             <button type="submit" class="btn primary small">儲存設定</button>
+            <button type="button" class="btn small" id="btn-bot-test">測試 Token</button>
             <span class="form-status" id="bot-status-text"></span>
           </div>
         </form>
@@ -124,6 +125,11 @@
           <div class="bot-cmds-title">斜線指令</div>
           <div id="bot-cmd-list" class="cmd-list"></div>
         </div>
+      </div>
+      <div class="bot-log-head">
+        <span>即時日誌</span>
+        <span class="spacer"></span>
+        <button class="btn ghost small" id="btn-bot-clear-log">清空</button>
       </div>
       <pre class="bot-log" id="bot-log">尚無日誌</pre>
     </section>

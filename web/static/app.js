@@ -628,6 +628,46 @@ botForm.addEventListener('submit', async (event) => {
   }
 });
 
+$('#btn-bot-test').addEventListener('click', async () => {
+  const token = botForm.token.value.trim();
+  setBotStatus('驗證 Token 中…', 'busy');
+  $('#btn-bot-test').disabled = true;
+  try {
+    const result = await api('/api/bot/test-token', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
+    if (result.ok) {
+      setBotStatus(`Token 有效：${result.username}（${result.id}）`, 'ok');
+    } else {
+      setBotStatus(result.error, 'err');
+    }
+  } catch (err) {
+    setBotStatus(err.message, 'err');
+  } finally {
+    $('#btn-bot-test').disabled = false;
+  }
+});
+
+$('#btn-bot-clear-log').addEventListener('click', async () => {
+  try {
+    await api('/api/bot/clear-log', { method: 'POST' });
+    $('#bot-log').textContent = '（已清空）';
+  } catch (err) {
+    setBotStatus(err.message, 'err');
+  }
+});
+
+function lastErrorLine(text) {
+  const lines = (text || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (/error|exception|failure|unauthorized|improper/i.test(lines[i])) {
+      return lines[i].replace(/^File ".*", line \d+, in /, '').slice(0, 110);
+    }
+  }
+  return '';
+}
+
 $('#btn-bot-start').addEventListener('click', () => botAction('start'));
 $('#btn-bot-restart').addEventListener('click', () => botAction('restart'));
 $('#btn-bot-stop').addEventListener('click', () => {
@@ -648,10 +688,14 @@ async function botAction(action) {
     });
     renderBot(result.bot);
     const ok = action === 'stop' ? result.bot.service !== 'active' : result.bot.service === 'active';
-    setBotStatus(
-      ok ? (action === 'stop' ? '已停止' : '已啟動') : '服務未持續執行，請看下方日誌',
-      ok ? 'ok' : 'err'
-    );
+    let message = ok
+      ? (action === 'stop' ? '已停止' : '已啟動')
+      : '服務未持續執行，請看下方日誌';
+    if (!ok) {
+      const detail = lastErrorLine(result.bot.log);
+      if (detail) message = `啟動失敗：${detail}`;
+    }
+    setBotStatus(message, ok ? 'ok' : 'err');
     refreshState();
   } catch (err) {
     setBotStatus(err.message, 'err');
@@ -678,9 +722,10 @@ function renderBot(bot) {
   chip.textContent = entry[0];
   chip.className = 'chip ' + entry[1];
 
-  $('#btn-bot-start').disabled = !bot.configured || bot.service === 'active';
+  $('#btn-bot-start').disabled = !bot.configured || bot.service === 'active' || botFormDirty;
   $('#btn-bot-stop').disabled = bot.service !== 'active';
-  $('#btn-bot-restart').disabled = !bot.configured;
+  $('#btn-bot-restart').disabled = !bot.configured || botFormDirty;
+  $('#btn-bot-start').title = botFormDirty ? '請先儲存設定' : '';
 
   if (!botFormDirty) {
     botForm.owner_id.value = bot.owner_id || '';
