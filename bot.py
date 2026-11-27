@@ -303,6 +303,7 @@ async def target_add(interaction: discord.Interaction, domain: str, client: str,
         "submitted_by": str(interaction.user),
         "submitted_at": datetime.now().isoformat(timespec="seconds"),
         "verified_at": None,
+        "verification": None,
         "approved_by": None,
         "max_threads": 0,
         "max_duration": 0,
@@ -326,7 +327,7 @@ async def target_add(interaction: discord.Interaction, domain: str, client: str,
         value=f"在 `https://{domain}{http_path}` 放置內容為\n`{token}` 的純文字檔",
         inline=False,
     )
-    embed.set_footer(text="完成後執行 /target verify 進行驗證")
+    embed.set_footer(text="完成後執行 /target verify 驗證；OWNER 也可直接 /target approve 跳過驗證核准")
     await interaction.response.send_message(embed=embed)
 
 
@@ -355,6 +356,7 @@ async def target_verify(interaction: discord.Interaction, key: str):
     if ok:
         t["status"] = "verified"
         t["verified_at"] = datetime.now().isoformat(timespec="seconds")
+        t["verification"] = "http" if "HTTP" in msg.upper() else "dns"
         save_targets(data)
         audit("TARGET-VERIFY", str(interaction.user), f"{key} 通過：{msg}")
         await interaction.followup.send(
@@ -366,7 +368,7 @@ async def target_verify(interaction: discord.Interaction, key: str):
         await interaction.followup.send(f"`{key}` 驗證失敗。\n{msg}")
 
 
-@target_group.command(name="approve", description="[OWNER] 核准目標並設定併發上限")
+@target_group.command(name="approve", description="[OWNER] 核准目標並設定併發上限（可跳過所有權驗證）")
 @app_commands.describe(key="目標", threads="允許的最大總併發", duration="允許的最大時長（秒）",
                        days="授權有效天數")
 @app_commands.autocomplete(key=target_autocomplete)
@@ -382,11 +384,16 @@ async def target_approve(interaction: discord.Interaction, key: str, threads: in
     if not t:
         await interaction.response.send_message("找不到該目標。", ephemeral=True)
         return
-    if t["status"] != "verified":
+
+    # OWNER 可直接核准未驗證的目標：驗證只是給客戶看的證據，
+    # 真正的閘門是 OWNER 的核准與每次壓測前的按鈕確認。
+    if t["status"] not in ("pending_verify", "verified", "approved", "suspended"):
         await interaction.response.send_message(
-            f"該目標狀態為 `{t['status']}`，必須先通過所有權驗證才能核准。", ephemeral=True
+            f"該目標狀態為 `{t['status']}`，無法核准。", ephemeral=True
         )
         return
+
+    was_verified = bool(t.get("verified_at"))
 
     limits = data.get("limits", {})
     g_t = limits.get("global_max_threads", 5000)
@@ -406,15 +413,30 @@ async def target_approve(interaction: discord.Interaction, key: str, threads: in
         max_threads=threads,
         max_duration=duration,
         authorized_until=until,
+        verification=t.get("verification") if was_verified else "owner_override",
     )
     save_targets(data)
-    audit("TARGET-APPROVE", str(interaction.user),
-          f"{key} {threads} 併發 / {duration}s 至 {until}")
+    audit(
+        "TARGET-APPROVE" if was_verified else "TARGET-APPROVE-UNVERIFIED",
+        str(interaction.user),
+        f"{key} {threads} 併發 / {duration}s 至 {until}"
+        + ("" if was_verified else "（未經驗證，Owner 授權）"),
+    )
 
-    await interaction.response.send_message(
+    body = (
         f"`{key}`（{t['domain']}）已核准。\n"
         f"上限 **{threads} 併發 / {duration} 秒**，授權至 **{until}**。"
     )
+    if was_verified:
+        body += f"\n所有權驗證：已通過（{t.get('verification', '—')}）"
+    else:
+        body += (
+            "\n\n⚠️ **此目標未通過所有權驗證**，由 OWNER 直接核准。\n"
+            "稽核日誌已記錄為 `TARGET-APPROVE-UNVERIFIED`。"
+            "請確認已取得客戶的書面壓測授權，該文件是唯一的責任憑證。"
+        )
+
+    await interaction.response.send_message(body)
 
 
 @target_group.command(name="suspend", description="[OWNER] 立即暫停目標，停止一切壓測")
@@ -451,11 +473,17 @@ async def target_list(interaction: discord.Interaction):
     if not targets:
         embed.add_field(name="尚無目標", value="使用 `/target add` 提交", inline=False)
     for k, v in targets.items():
+        ver = v.get("verification")
+        ver_text = {
+            "dns": "所有權：DNS TXT 已驗證",
+            "http": "所有權：HTTP 檔案已驗證",
+            "owner_override": "⚠️ 所有權：未驗證（Owner 直接核准）",
+        }.get(ver, "所有權：未驗證")
         embed.add_field(
             name=f"{k} — {v['domain']} [{v['status']}]",
             value=f"客戶 {v['client']}\n"
                   f"上限 {v['max_threads']} 併發 / {v['max_duration']}s · "
-                  f"授權至 {v['authorized_until'] or '—'}",
+                  f"授權至 {v['authorized_until'] or '—'}\n{ver_text}",
             inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)

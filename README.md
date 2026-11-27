@@ -4,7 +4,7 @@
 
 另附一套**網頁控制台**（`web/`）：在同一個瀏覽器頁面看到所有節點的在線狀態、延遲走勢與容量，並可一鍵部署全部伺服器。
 
-> **這個專案要求目標域名必須通過所有權驗證。** 未經驗證的域名不會產生任何流量。詳見 [安全性與合規](#安全性與合規)。
+> **每次壓測都需要 OWNER 在 Discord 按下核准按鈕。** 目標可經 DNS／HTTP 驗證，或由 OWNER 直接核准（記為 `TARGET-APPROVE-UNVERIFIED`）。詳見 [安全性與合規](#安全性與合規)。
 
 ---
 
@@ -53,7 +53,7 @@ flowchart LR
 | 控制平面 | Discord Bot | 權限檢查、目標驗證、節點分配、結果統計 |
 | 網頁控制台 | 節點運維 UI | 節點在線狀態、一鍵部署、部署日誌串流 |
 | 壓測節點 | JMeter Server | 接收計畫並產生流量，可水平擴充 |
-| 目標站點 | 待測系統 | 必須先通過所有權驗證 |
+| 目標站點 | 待測系統 | 需通過所有權驗證，或由 OWNER 直接核准 |
 
 控制平面本身不產生流量，只負責下發 JMeter 計畫（`-R` 指定節點）與收集結果。網頁控制台只做節點運維，**不參與壓測授權流程**——壓測仍然只能從 Discord 由 OWNER 核准發起。
 
@@ -71,7 +71,7 @@ flowchart LR
 **目標治理**
 
 - 目標生命週期：`pending_verify` → `verified` → `approved` → `suspended`
-- 域名所有權驗證：DNS TXT 記錄或 HTTP 驗證檔，二擇一
+- 域名所有權驗證：DNS TXT 記錄或 HTTP 驗證檔，二擇一（OWNER 可跳過，見下）
 - 拒絕解析到內網／保留位址的目標（防止被用來探測內部網路）
 - 授權有到期日，過期自動失效
 
@@ -516,11 +516,17 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 ### 目標生命週期
 
 ```
-pending_verify  ──/target verify──▶  verified  ──/target approve──▶  approved
-      │                                  │                              │
-      │                                  │                              ├─▶ /loadtest
-      └──────────── 授權過期 ─────────────┴──── /target suspend ────────▶ suspended
+pending_verify ──/target verify──▶ verified ──┐
+      │                                        ├──/target approve──▶ approved ──▶ /loadtest
+      └────────────/target approve─────────────┘        │                  │
+                （OWNER 跳過驗證）                       │                  │
+                                          /target suspend ────────────────┘
 ```
+
+- **走驗證**：`pending_verify` → `/target verify` → `verified` → `/target approve` → `approved`
+- **不走驗證**：`pending_verify` → `/target approve`（僅 OWNER）→ `approved`，記錄為 `verification: owner_override`
+
+兩條路都一樣：`/loadtest` 只能對 `approved` 的目標發起，而且**每次執行都要 OWNER 按下核准按鈕**。
 
 ### 完整操作範例
 
@@ -560,6 +566,8 @@ Bot 會回傳驗證 token 與兩種驗證方式。
 
 狀態變為 `approved`，授權至 30 天後。
 
+> 客戶來不及加 DNS 記錄時，OWNER 可以在 `pending_verify` 狀態直接執行這條指令，跳過驗證。回應會標註「此目標未通過所有權驗證」，稽核日誌記為 `TARGET-APPROVE-UNVERIFIED`。**客戶的書面授權書要記得存檔**——那是這種情況下唯一的憑證。
+
 **⑤ 發起壓測**
 
 ```
@@ -580,9 +588,9 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 |---|---|---|
 | `/target add` | STAFF | 提交目標，產生所有權驗證 token |
 | `/target verify` | STAFF | 驗證域名所有權 |
-| `/target approve` | **OWNER** | 核准目標並設定併發／時長上限 |
+| `/target approve` | **OWNER** | 核准目標並設定併發／時長上限；`pending_verify` 狀態可直接核准（跳過驗證，記為 UNVERIFIED） |
 | `/target suspend` | **OWNER** | 立即暫停目標 |
-| `/target list` | STAFF | 列出所有目標與授權狀態 |
+| `/target list` | STAFF | 列出所有目標、授權狀態與驗證來源 |
 | `/nodes` | STAFF | 檢查節點連線狀態與有效容量 |
 | `/loadtest` | STAFF | 發起壓測（需 OWNER 按鈕核准） |
 | `/loadtest override:true` | **OWNER** | 突破目標授權上限，受全域上限約束 |
@@ -717,13 +725,22 @@ sudo journalctl -u jmeter-server -n 50
 
 ### 目標所有權驗證
 
-本專案**強制要求**目標域名通過所有權驗證（`core/verify.py`）。這不是可選功能，而是平台的法律基礎：
+目標可以走兩條路核准，差別在於**有沒有留下可稽核的所有權證據**：
 
-- 客戶口頭聲稱擁有某域名，不構成可驗證的授權
-- DNS TXT 記錄或網站根目錄檔案，是可稽核的所有權證明
-- 驗證記錄、核准人、授權期限全部留存在 `targets.json` 與 `audit.log`
+| 路徑 | 誰能做 | 證據 | 稽核記錄 |
+|---|---|---|---|
+| `/target verify` → `/target approve` | STAFF 驗證、OWNER 核准 | DNS TXT 或 HTTP 檔案 | `TARGET-VERIFY` + `TARGET-APPROVE` |
+| `/target approve`（直接） | 僅 OWNER | 無 | `TARGET-APPROVE-UNVERIFIED` |
 
-**移除或繞過此模組，本專案即退化為壓力測試即服務（stresser）工具，可能違反《電腦犯罪相關法規》。**
+第二條路是刻意保留的：客戶常常還沒準備好改 DNS，或域名在客戶的雲廠商手上不好操作，OWNER 需要能先開工。但要知道代價——
+
+- 客戶口頭聲稱擁有某域名，**不構成可驗證的授權**
+- 走第二條路時，平台內沒有任何東西能證明那個域名是客戶的
+- 唯一的責任憑證是你們與客戶簽的壓測委託書（SOW／授權書），出事時它必須拿得出來
+
+所以實務上的分工是：**能驗證就驗證**（成本只是加一條 TXT 記錄），趕時間才由 OWNER 直接核准，並把 SOW 存檔對應到 `audit.log` 的那一行。
+
+核准人、授權上限、授權期限仍然全部留在 `targets.json` 與 `audit.log`。**移除整個授權流程（讓任何人都能對任意域名壓測）才會退化為 stresser 工具**，那條線不要跨。
 
 ### 營運建議
 
