@@ -3,7 +3,7 @@
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="壓測範本（改完變數按開始）" enabled="true">
       <stringProp name="TestPlan.comments">【使用方式】
-1. 點左邊樹狀圖的「使用者定義的變數」
+1. 點左邊樹狀圖第一項「① 使用者定義的變數（改這裡）」
 2. 改 HOST → 你的目標網域（不要含 https:// 與路徑）
    例：HOST = moodle.example.com
 3. 改 PATH → 要壓的路徑，例 / 或 /login/index.php
@@ -25,7 +25,14 @@
       <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
       <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
       <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="使用者定義的變數" enabled="true">
-        <collectionProp name="Arguments.arguments">
+        <collectionProp name="Arguments.arguments"/>
+      </elementProp>
+
+      <stringProp name="TestPlan.user_define_classpath"></stringProp>
+    </TestPlan>
+    <hashTree>
+      <Arguments guiclass="ArgumentsPanel" testclass="Arguments" testname="① 使用者定義的變數（改這裡）" enabled="true">
+<collectionProp name="Arguments.arguments">
           <elementProp name="PROTOCOL" elementType="Argument">
             <stringProp name="Argument.name">PROTOCOL</stringProp>
             <stringProp name="Argument.value">https</stringProp>
@@ -62,11 +69,9 @@
             <stringProp name="Argument.metadata">=</stringProp>
           </elementProp>
         </collectionProp>
-      </elementProp>
-      <stringProp name="TestPlan.user_define_classpath"></stringProp>
-    </TestPlan>
-    <hashTree>
-      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="壓測執行緒" enabled="true">
+      </Arguments>
+      <hashTree/>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="② 壓測執行緒（併發數在這裡生效）" enabled="true">
         <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
         <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="迴圈控制器" enabled="true">
           <boolProp name="LoopController.continue_forever">true</boolProp>
@@ -124,7 +129,7 @@
           <hashTree/>
         </hashTree>
       </hashTree>
-      <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="彙總報告（看這個）" enabled="true">
+      <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="③ 彙總報告（看結果）" enabled="true">
         <boolProp name="ResultCollector.error_logging">false</boolProp>
         <objProp>
           <name>saveConfig</name>
@@ -161,7 +166,7 @@
         <stringProp name="filename"></stringProp>
       </ResultCollector>
       <hashTree/>
-      <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="結果樹（除錯才開，高併發會拖垮 JMeter）" enabled="false">
+      <ResultCollector guiclass="ViewResultsFullVisualizer" testclass="ResultCollector" testname="④ 結果樹（除錯才開，高併發會拖垮 JMeter）" enabled="false">
         <boolProp name="ResultCollector.error_logging">false</boolProp>
         <objProp>
           <name>saveConfig</name>

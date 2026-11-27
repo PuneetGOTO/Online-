@@ -794,7 +794,7 @@ sudo journalctl -u jmeter-server -n 50
 
 ### `tools/loadtest-template.jmx`
 
-用 JMeter GUI 直接打開就能跑。樹狀圖最上面是「使用者定義的變數」，改這七個值即可：
+用 JMeter GUI 直接打開就能跑。樹狀圖第一項就是「① 使用者定義的變數（改這裡）」，點它改這七個值：
 
 | 變數 | 說明 | 預設 |
 |---|---|---|
