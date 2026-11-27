@@ -28,3 +28,6 @@ Thumbs.db
 
 # 快速壓測腳本的輸出
 tools/runs/
+
+# 執行時產生的授權名單
+config/admins.json

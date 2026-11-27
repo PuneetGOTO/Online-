@@ -210,10 +210,33 @@ def get_cred(key: str) -> Optional[dict]:
 # ---------------------------------------------------------------- Discord 設定
 
 ENV_FILE = PROJECT_DIR / ".env"
+ADMINS_FILE = PROJECT_DIR / "config" / "admins.json"
 BOT_UNIT = "loadtest-bot"
 BOT_LOG = PROJECT_DIR / "logs" / "bot.log"
 
+
+def read_admins() -> list[str]:
+    try:
+        data = json.loads(ADMINS_FILE.read_text(encoding="utf-8"))
+        return [str(x).strip() for x in data.get("admins", []) if str(x).strip().isdigit()]
+    except Exception:
+        return []
+
+
+def write_admins(ids: list[str]) -> None:
+    ADMINS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"_comment": "Discord 使用者 ID，可用 /start 與其他指令；OWNER 不需列在這裡",
+               "admins": ids}
+    tmp = ADMINS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ADMINS_FILE)
+    try:
+        ADMINS_FILE.chmod(0o640)
+    except Exception:
+        pass
+
 SLASH_COMMANDS = [
+    ("/start url port threads https-get", "一句話壓測：網址 埠 併發 協定-方法（OWNER 與授權管理員）"),
     ("/target add", "提交壓測目標，產生所有權驗證 token"),
     ("/target verify", "驗證目標的域名所有權"),
     ("/target approve", "OWNER 核准目標並設定併發上限"),
@@ -314,6 +337,7 @@ def bot_status() -> dict:
         "owner_id": env.get("OWNER_ID", ""),
         "staff_ids": env.get("STAFF_IDS", ""),
         "guild_id": env.get("GUILD_ID", ""),
+        "admins": read_admins(),
         "log": tail_log(BOT_LOG, 25),
         "commands": [{"cmd": c, "desc": d} for c, d in SLASH_COMMANDS],
     }
@@ -1255,6 +1279,7 @@ class BotConfigBody(BaseModel):
     owner_id: str = ""
     staff_ids: str = ""
     guild_id: str = ""
+    admin_ids: Optional[str] = None
 
 
 class BotActionBody(BaseModel):
@@ -1291,13 +1316,29 @@ async def save_bot_config(body: BotConfigBody, request: Request, _=Depends(requi
             raise HTTPException(status_code=400, detail="Token 長度不正確，請確認複製完整")
         updates["DISCORD_TOKEN"] = token
 
+    admins = None
+    if body.admin_ids is not None:
+        admins = []
+        for item in body.admin_ids.replace(",", " ").split():
+            if not item.isdigit():
+                raise HTTPException(status_code=400, detail="管理員 ID 只能是數字，以逗號分隔")
+            admins.append(item)
+
+    before = await asyncio.to_thread(read_env)
+    changed = any(before.get(key) != value for key, value in updates.items())
+
     await asyncio.to_thread(write_env, updates)
+    if admins is not None:
+        await asyncio.to_thread(write_admins, admins)
+
     audit("BOT-CONFIG", request.client.host if request.client else "-",
-          f"token={'updated' if token else 'kept'} owner={owner} staff={len(staff)}")
+          f"token={'updated' if token else 'kept'} owner={owner} staff={len(staff)} "
+          f"admins={len(admins) if admins is not None else '-'}")
 
     status = await asyncio.to_thread(bot_status)
     restarted = False
-    if status["service"] == "active":
+    # 管理員名單由 bot 每次執行時讀取，改完不必重啟；只有 .env 真的變了才重啟
+    if changed and status["service"] == "active":
         await asyncio.to_thread(systemctl_bot, "restart")
         await asyncio.sleep(2.5)
         status = await asyncio.to_thread(bot_status)

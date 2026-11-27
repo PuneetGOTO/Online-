@@ -13,10 +13,12 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -30,6 +32,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 BASE_DIR = Path(__file__).parent
 CONFIG_DIR = BASE_DIR / "config"
+ADMINS_FILE = CONFIG_DIR / "admins.json"
 TARGETS_FILE = CONFIG_DIR / "targets.json"
 NODES_FILE = CONFIG_DIR / "nodes.json"
 PLANS_DIR = BASE_DIR / "plans"
@@ -126,8 +129,21 @@ def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 
+def load_admins() -> set:
+    """網站授權的管理員名單（config/admins.json）。每次讀取，改完立即生效。"""
+    try:
+        data = json.loads(ADMINS_FILE.read_text(encoding="utf-8"))
+        return {int(x) for x in data.get("admins", []) if str(x).strip().isdigit()}
+    except Exception:
+        return set(STAFF_IDS)  # 尚未建立時沿用舊的 STAFF_IDS
+
+
+def is_admin(uid: int) -> bool:
+    return uid == OWNER_ID or uid in load_admins()
+
+
 def is_staff(uid: int) -> bool:
-    return uid == OWNER_ID or uid in STAFF_IDS
+    return is_admin(uid)
 
 
 def plan_path(name: str) -> Path | None:
@@ -140,13 +156,13 @@ def plan_path(name: str) -> Path | None:
 # ---------------------------------------------------------------- 執行流程
 async def execute_test(channel, key: str, target: dict, chosen: list,
                        per_node: int, actual_total: int, duration: int,
-                       operator: str, override: bool) -> None:
+                       operator: str, override: bool, extra: dict = None) -> None:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     jtl = RESULTS_DIR / f"{key}-{ts}.jtl"
     report = RESULTS_DIR / f"{key}-{ts}-report"
     cmd = dist.build_command(
         JMETER_BIN, plan_path(target["plan"]), chosen, per_node,
-        duration, target["domain"], jtl, report,
+        duration, target["domain"], jtl, report, extra=extra,
     )
 
     RUNNING.update(active=True, started=datetime.now(), label=key)
@@ -735,6 +751,127 @@ async def loadtest(interaction: discord.Interaction, key: str, threads: int,
     await interaction.response.send_message(
         embed=embed,
         view=ApproveView(key, t, chosen, per_node, actual, duration, override),
+    )
+
+
+# ---------------------------------------------------------------- 一句話壓測
+def parse_mode(text: str) -> tuple[str, str]:
+    """https-get → ("https", "GET")"""
+    raw = (text or "").strip().lower().replace("_", "-")
+    protocol, _, method = raw.partition("-")
+    if protocol not in ("http", "https"):
+        raise ValueError("協定只能是 http 或 https，例：`https-get`")
+    method = (method or "get").upper()
+    if method not in ("GET", "POST"):
+        raise ValueError("方法只能是 get 或 post，例：`https-get`")
+    return protocol, method
+
+
+def make_key(host: str) -> str:
+    return (re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:40]) or "target"
+
+
+@tree.command(name="start", description="一句話發起壓測（OWNER 與網站授權的管理員）")
+@app_commands.describe(
+    url="完整網址，例 https://example.com/login/index.php",
+    port="連接埠，例 443",
+    threads="併發執行緒數，例 300",
+    mode="協定與方法，例 https-get / https-post / http-get",
+    duration="持續秒數，預設 60",
+)
+async def start_cmd(interaction: discord.Interaction, url: str, port: int,
+                    threads: int, mode: str = "https-get", duration: int = 60):
+    uid = interaction.user.id
+    if not is_admin(uid):
+        await interaction.response.send_message(
+            "你沒有權限。只有 OWNER 與網站授權的管理員可以發起壓測。", ephemeral=True)
+        audit("DENY-START", str(interaction.user), f"{url} {threads}x{duration}")
+        return
+
+    try:
+        protocol, method = parse_mode(mode)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    raw = url.strip()
+    if "://" not in raw:
+        raw = f"{protocol}://{raw}"
+    parsed = urlparse(raw)
+    host = parsed.hostname or ""
+    if not host or "." not in host:
+        await interaction.response.send_message(
+            f"網址無法解析：`{url}`\n請用完整格式，例 `https://example.com/login/index.php`",
+            ephemeral=True)
+        return
+    if parsed.scheme in ("http", "https"):
+        protocol = parsed.scheme
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    data = load_targets()
+    limits = data.get("limits", {})
+    max_threads = int(limits.get("global_max_threads", 5000))
+    max_duration = int(limits.get("global_max_duration", 1800))
+    if not 1 <= threads <= max_threads:
+        await interaction.response.send_message(
+            f"併發須介於 1 ~ {max_threads}。", ephemeral=True)
+        return
+    if not 5 <= duration <= max_duration:
+        await interaction.response.send_message(
+            f"時長須介於 5 ~ {max_duration} 秒。", ephemeral=True)
+        return
+    if RUNNING["active"]:
+        await interaction.response.send_message(
+            "已有測試在執行中，請先 `/abort`。", ephemeral=True)
+        return
+
+    nodes = load_nodes()
+    chosen, per_node, actual = dist.allocate(threads, nodes)
+    if not chosen:
+        await interaction.response.send_message(
+            f"節點容量不足：目前有效容量 {dist.effective_capacity(nodes)} 併發。",
+            ephemeral=True)
+        return
+
+    key = make_key(host)
+    now = datetime.now().isoformat(timespec="seconds")
+    target = data.setdefault("targets", {}).setdefault(key, {})
+    target.update(
+        domain=host,
+        client=target.get("client") or "即時壓測",
+        plan="oneshot.jmx",
+        status="approved",
+        token=target.get("token", ""),
+        submitted_by=target.get("submitted_by") or str(interaction.user),
+        submitted_at=target.get("submitted_at") or now,
+        verified_at=target.get("verified_at"),
+        verification=target.get("verification") or "admin_start",
+        approved_by=str(interaction.user),
+        approved_at=now,
+        max_threads=threads,
+        max_duration=duration,
+        authorized_until=(datetime.now() + timedelta(days=1)).date().isoformat(),
+        last_url=raw,
+        last_port=port,
+        last_method=method,
+    )
+    save_targets(data)
+    audit("START", str(interaction.user),
+          f"{key} {protocol}://{host}:{port}{path} {threads}x{duration}s {method}")
+
+    await interaction.response.defer()
+    await interaction.followup.send(
+        f"**開始壓測** · `{protocol}://{host}:{port}{path}`\n"
+        f"{method} · 併發 **{threads}**（{len(chosen)} 節點 × {per_node}）"
+        f" · 持續 **{duration} 秒**\n"
+        f"操作者 {interaction.user.mention}"
+    )
+    await execute_test(
+        interaction.channel, key, target, chosen, per_node, actual,
+        duration, str(interaction.user), False,
+        extra={"protocol": protocol, "port": port, "path": path, "method": method},
     )
 
 

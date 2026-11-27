@@ -63,8 +63,9 @@ flowchart LR
 
 **授權模型**
 
-- 三層權限：`OWNER` / `STAFF` / 其他人（完全拒絕）
-- 每次壓測執行都需要 OWNER 在 Discord 上按下核准按鈕
+- 三層權限：`OWNER` / 授權管理員（網頁設定）/ 其他人（完全拒絕）
+- 一句話壓測：`/start 網址 埠 併發 https-get`，僅 OWNER 與授權管理員可用
+- 走完整流程的 `/loadtest` 仍需 OWNER 在 Discord 按下核准按鈕
 - `override` 僅 OWNER 可用，且永遠受全域硬上限約束
 - 所有操作（含被拒絕的嘗試）寫入 `audit.log`
 
@@ -431,7 +432,8 @@ WEB_TOKEN=你的權杖 .venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --
 | Bot Token | Discord Developer Portal → Bot → Reset Token。已設定過會顯示 `MTIzND…ABCD` 這種遮罩，**留空則不變更** |
 | Owner ID | 你的 Discord 使用者 ID，唯一能核准壓測的人 |
 | Guild ID | 填了斜線指令**立即生效**；不填要等全域同步（最多 1 小時） |
-| Staff IDs | 安全人員 ID，逗號分隔，可留空 |
+| Staff IDs | 舊版欄位，保留相容；新設定請用下一欄 |
+| 授權管理員 IDs | 可用 `/start` 與所有指令的 Discord 使用者 ID，逗號分隔；Owner 不需填 |
 
 按「儲存設定」會寫回 `.env`；如果 Bot 正在執行，會自動重啟讓新設定生效。
 
@@ -533,6 +535,29 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 
 ## 使用流程
 
+### 一句話壓測（最常用）
+
+```
+/start https://example.com/login/index.php 443 300 https-get
+```
+
+| 位置 | 意義 | 例 |
+|---|---|---|
+| 1 | 完整網址 | `https://example.com/login/index.php` |
+| 2 | 連接埠 | `443` |
+| 3 | 併發執行緒 | `300` |
+| 4 | 協定-方法 | `https-get` / `https-post` / `http-get` |
+| 5 | 持續秒數（選填） | `120`，預設 60 |
+
+一條指令就完成：解析網址 → 建立目標 → 核准 → 分配節點 → 開始壓測。
+不用先 `/target add`、也不用按核准按鈕。
+
+**權限**：只有 `OWNER` 與「網頁控制台授權的管理員」能用，其他人一律拒絕並記錄
+`DENY-START`。管理員名單在控制台的 Discord 面板填寫，改完立即生效，不必重啟 Bot。
+
+**限制**：併發與時長仍受 `config/targets.json` 的 `global_max_threads` /
+`global_max_duration` 約束；同一時間只能有一場壓測在跑。
+
 ### 目標生命週期
 
 ```
@@ -606,15 +631,16 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 
 | 指令 | 權限 | 說明 |
 |---|---|---|
-| `/target add` | STAFF | 提交目標，產生所有權驗證 token |
-| `/target verify` | STAFF | 驗證域名所有權 |
+| `/start url port threads mode` | **OWNER** / 授權管理員 | 一句話壓測，自動建立目標並執行 |
+| `/target add` | 授權管理員 | 提交目標，產生所有權驗證 token |
+| `/target verify` | 授權管理員 | 驗證域名所有權 |
 | `/target approve` | **OWNER** | 核准目標並設定併發／時長上限；`pending_verify` 狀態可直接核准（跳過驗證，記為 UNVERIFIED） |
 | `/target suspend` | **OWNER** | 立即暫停目標 |
-| `/target list` | STAFF | 列出所有目標、授權狀態與驗證來源 |
-| `/nodes` | STAFF | 檢查節點連線狀態與有效容量 |
-| `/loadtest` | STAFF | 發起壓測（需 OWNER 按鈕核准） |
+| `/target list` | 授權管理員 | 列出所有目標、授權狀態與驗證來源 |
+| `/nodes` | 授權管理員 | 檢查節點連線狀態與有效容量 |
+| `/loadtest` | 授權管理員 | 發起壓測（需 OWNER 按鈕核准） |
 | `/loadtest override:true` | **OWNER** | 突破目標授權上限，受全域上限約束 |
-| `/abort` | STAFF | 中止執行中的壓測 |
+| `/abort` | 授權管理員 | 中止執行中的壓測 |
 
 ---
 

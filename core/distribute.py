@@ -79,11 +79,12 @@ def build_command(
     host: str,
     jtl: Path,
     report: Path,
+    extra: dict = None,
 ) -> list[str]:
     hosts = ",".join(cfg["host"] + (f":{cfg['port']}" if cfg.get("port", 1099) != 1099 else "")
                      for _, cfg in nodes)
     ramp = compute_ramp(per_node, duration)
-    return [
+    cmd = [
         jmeter_bin,
         "-n",
         "-t", str(plan),
@@ -96,6 +97,11 @@ def build_command(
         "-l", str(jtl),
         "-e", "-o", str(report),
     ]
+    # 一次性壓測用：協定、埠、路徑、方法都由指令帶入
+    for key, value in (extra or {}).items():
+        if value is not None and str(value) != "":
+            cmd.append(f"-J{key}={value}")
+    return cmd
 
 
 async def run_distributed(cmd: list[str], jtl: Path, cwd: Path, on_progress,

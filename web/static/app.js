@@ -600,7 +600,7 @@ const botForm = $('#bot-form');
 let botFormDirty = false;
 let botCmdsRendered = false;
 
-['token', 'owner_id', 'staff_ids', 'guild_id'].forEach((name) => {
+['token', 'owner_id', 'staff_ids', 'guild_id', 'admin_ids'].forEach((name) => {
   botForm[name].addEventListener('input', () => {
     botFormDirty = true;
   });
@@ -617,6 +617,7 @@ botForm.addEventListener('submit', async (event) => {
         owner_id: botForm.owner_id.value.trim(),
         staff_ids: botForm.staff_ids.value.trim(),
         guild_id: botForm.guild_id.value.trim(),
+        admin_ids: botForm.admin_ids.value.trim(),
       }),
     });
     botFormDirty = false;
@@ -732,6 +733,7 @@ function renderBot(bot) {
     botForm.owner_id.value = bot.owner_id || '';
     botForm.staff_ids.value = bot.staff_ids || '';
     botForm.guild_id.value = bot.guild_id || '';
+    botForm.admin_ids.value = (bot.admins || []).join(', ');
     botForm.token.value = '';
   }
   botForm.token.placeholder = bot.configured
