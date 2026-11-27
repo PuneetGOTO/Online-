@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -187,8 +188,18 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
         except discord.HTTPException:
             pass
 
+    jmeter_log = RESULTS_DIR / f"{key}-{ts}-jmeter.log"
+
+    def register_proc(proc) -> None:
+        RUNNING["proc"] = proc
+
     try:
-        rc = await dist.run_distributed(cmd, jtl, PLANS_DIR, on_progress)
+        rc = await dist.run_distributed(
+            cmd, jtl, PLANS_DIR, on_progress,
+            log_path=jmeter_log,
+            deadline=time.time() + duration + 180,
+            on_start=register_proc,
+        )
     except FileNotFoundError:
         await channel.send(f"找不到 JMeter：`{JMETER_BIN}`，請檢查 .env。")
         audit("ERROR", operator, "JMeter 不存在")
@@ -202,6 +213,18 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
             requests=progress["count"],
             **base,
         )
+
+    if rc == -9:
+        write_status("failed", elapsed=duration, requests=progress["count"],
+                     error=f"逾時未結束（超過 {duration + 180}s）", **base)
+        audit("TIMEOUT", operator, f"{key} 超過 {duration + 180}s 強制終止")
+        await channel.send(
+            f"`{key}` 壓測逾時未結束（超過時長 {duration}s + 180s 寬限），已強制終止。\n"
+            f"常見原因：節點回傳通道不通（master 的 `java.rmi.server.hostname` "
+            f"未設為公網 IP，或安全組未放行 RMI 回傳埠）。\n"
+            f"JMeter 日誌：`{jmeter_log.name}`"
+        )
+        return
 
     if not jtl.exists():
         await channel.send(

@@ -6,6 +6,7 @@ JMeter 分散式模式的重點：每個 remote engine 會各自跑一份計畫�
 """
 import asyncio
 import math
+import time
 from pathlib import Path
 
 
@@ -97,20 +98,43 @@ def build_command(
     ]
 
 
-async def run_distributed(cmd: list[str], jtl: Path, cwd: Path, on_progress, poll: int = 10) -> int:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    while proc.returncode is None:
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=poll)
-        except asyncio.TimeoutError:
-            count = 0
-            if jtl.exists():
-                with open(jtl, encoding="utf-8", errors="replace") as f:
-                    count = max(0, sum(1 for _ in f) - 1)
-            await on_progress(count)
-    return proc.returncode
+async def run_distributed(cmd: list[str], jtl: Path, cwd: Path, on_progress,
+                          poll: int = 10, log_path: Path = None,
+                          deadline: float = None, on_start=None) -> int:
+    """執行分散式壓測。
+
+    log_path  : 把 JMeter 的 stdout/stderr 寫進檔案（否則出錯時完全看不到原因）
+    deadline  : 絕對時間戳，超過就強制終止（避免 RMI 卡死時永遠不返回）
+    on_start  : 取得 process 物件，供 /abort 終止
+    """
+    sink = open(log_path, "wb") if log_path else asyncio.subprocess.DEVNULL
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            stdout=sink,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        if on_start is not None:
+            on_start(proc)
+
+        while proc.returncode is None:
+            if deadline is not None and time.time() > deadline:
+                proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass
+                return -9
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=poll)
+            except asyncio.TimeoutError:
+                count = 0
+                if jtl.exists():
+                    with open(jtl, encoding="utf-8", errors="replace") as f:
+                        count = max(0, sum(1 for _ in f) - 1)
+                await on_progress(count)
+        return proc.returncode
+    finally:
+        if log_path:
+            sink.close()

@@ -54,9 +54,21 @@ fi
 PROP="${JMETER_HOME}/bin/jmeter.properties"
 sed -i 's/^#\?server\.rmi\.ssl\.disable=.*/server.rmi.ssl.disable=true/' "$PROP"
 grep -q '^server.rmi.ssl.disable' "$PROP" || echo 'server.rmi.ssl.disable=true' >> "$PROP"
-sed -i "s/^#\?java\.rmi\.server\.hostname=.*/java.rmi.server.hostname=${SELF_IP}/" "$PROP"
-grep -q '^java.rmi.server.hostname' "$PROP" || echo "java.rmi.server.hostname=${SELF_IP}" >> "$PROP"
-c_ok "已設定 server.rmi.ssl.disable=true"
+
+# master 接收節點回傳結果的固定埠（安全組需放行，節點才連得回來）
+CLIENT_RMI_PORT="${CLIENT_RMI_PORT:-4000}"
+sed -i "s/^#\?client\.rmi\.localport=.*/client.rmi.localport=${CLIENT_RMI_PORT}/" "$PROP"
+grep -q '^client.rmi.localport' "$PROP" || echo "client.rmi.localport=${CLIENT_RMI_PORT}" >> "$PROP"
+
+# java.rmi.server.hostname 必須是 JVM 系統屬性才會生效。
+# 只寫在 jmeter.properties 沒用：節點會拿到 master 的主機名（解析成 127.0.1.1），
+# 樣本永遠送不回來，壓測就一直卡在「執行中」。
+SYSPROP="${JMETER_HOME}/bin/system.properties"
+touch "$SYSPROP"
+sed -i '/^java\.rmi\.server\.hostname=/d' "$SYSPROP"
+echo "java.rmi.server.hostname=${SELF_IP}" >> "$SYSPROP"
+sed -i '/^java\.rmi\.server\.hostname=/d' "$PROP"
+c_ok "RMI 設定完成（SSL 關閉 · 回傳埠 ${CLIENT_RMI_PORT} · 對外位址 ${SELF_IP}）"
 
 # ---------------------------------------------------------------- 3. 服務帳號與檔案
 id -u "${SERVICE_USER}" >/dev/null 2>&1 || useradd -r -m -s /bin/bash "${SERVICE_USER}"
@@ -210,7 +222,8 @@ fi
 
 # ---------------------------------------------------------------- 7. 防火牆
 ufw allow "${RMI_PORT}/tcp" comment 'jmeter master rmi' >/dev/null 2>&1 || true
-ufw allow "${RMI_LOCAL_PORT}/tcp" comment 'jmeter master rmi data' >/dev/null 2>&1 || true
+# JMeter 的 RMI 回傳會從 client.rmi.localport 起連續佔用數個埠
+ufw allow "${CLIENT_RMI_PORT}:$((CLIENT_RMI_PORT + 10))/tcp" comment 'jmeter result callback' >/dev/null 2>&1 || true
 ufw allow "${WEB_PORT}/tcp" comment 'loadtest web console' >/dev/null 2>&1 || true
 c_warn "已放行 ${WEB_PORT}/tcp。控制台可部署伺服器，建議限制來源："
 c_warn "  sudo ufw delete allow ${WEB_PORT}/tcp"

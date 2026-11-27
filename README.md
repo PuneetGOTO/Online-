@@ -133,7 +133,7 @@ flowchart LR
 |---|---|---|
 | 主服務器 | Ubuntu 22.04 / 24.04<br/>2 vCPU / 2 GB | 需安裝 Python 3.10+、JMeter |
 | 壓測節點 | Ubuntu 22.04 / 24.04<br/>4 vCPU / 8 GB 起 | 每 vCPU 約可承載 100~150 執行緒 |
-| 網路 | 主服務器 → 節點 1099 / 4000 | 節點防火牆僅放行主服務器 IP |
+| 網路 | 主服務器 → 節點 1099 / 4000<br/>節點 → 主服務器 4000~4010 | 雙向都要通；回傳通道不通會讓壓測卡住 |
 
 所有機器的 **JMeter 版本必須完全一致**（本專案固定 5.6.3），否則 RMI 無法通訊。
 
@@ -202,7 +202,7 @@ sudo ./setup-master.sh
 | 步驟 | 內容 |
 |---|---|
 | 系統套件 | Python 3、venv、pip、OpenJDK 17、curl、tar、ufw、rsync |
-| JMeter | 下載 5.6.3 至 `/opt/jmeter`，設定 `server.rmi.ssl.disable=true` |
+| JMeter | 下載 5.6.3 至 `/opt/jmeter`；`server.rmi.ssl.disable=true`、`client.rmi.localport=4000`；`java.rmi.server.hostname` 寫入 `system.properties`（JVM 屬性，寫在 jmeter.properties 無效） |
 | 服務帳號 | 建立 `loadtest` 系統使用者 |
 | 檔案同步 | 專案複製到 `/opt/loadtest-platform`（排除 `.env`、`results`、`audit.log`） |
 | Python 環境 | 建立 `.venv` 並安裝 `discord.py`、`aiohttp`、`dnspython`、`fastapi`、`uvicorn` |
@@ -710,7 +710,9 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 | Bot 顯示「啟動失敗」 | Token 錯誤或已被重置 | 看面板日誌，重新產生 Token 並貼上 |
 | Bot 啟動後馬上停止 | `OWNER_ID` 為空或格式錯 | 填數字 ID，不是使用者名稱 |
 | 部署卡在「安裝 JMeter」 | 官方 archive 鏡像只有 ~50 KB/s | 腳本已內建 dlcdn → 清華 → archive 三段回退，正常 1 分鐘內完成 |
-| 部署長時間無輸出 | 正在下載 85 MB 的 JMeter | 每 30 秒會顯示「仍在執行」，可按中止（會一併殺掉遠端程序） |
+| 壓測一直「執行中」、已送回 0 筆 | `java.rmi.server.hostname` 沒設成 JVM 屬性，master 對外宣告主機名（解析成 127.0.1.1），節點連不回 | 寫進 `/opt/jmeter/bin/system.properties` 後重跑；節點日誌會出現 `Connection refused to host: 127.0.1.1` |
+| 同上，但日誌顯示公網 IP | 安全組沒放行 RMI 回傳埠 | 放行 master 的 `4000~4010/tcp`（JMeter 會連續佔用數個埠） |
+| 壓測逾時被強制終止 | 上述兩者之一 | Bot 會在 `時長 + 180s` 後終止並提示；JMeter 日誌存在 `results/<目標>-<時間>-jmeter.log` || 部署長時間無輸出 | 正在下載 85 MB 的 JMeter | 每 30 秒會顯示「仍在執行」，可按中止（會一併殺掉遠端程序） |
 | 節點顯示離線但部署成功 | 節點在 VPC 外，防火牆白名單寫成了內網 IP | 在 `.env` 設 `MASTER_IP=<公網IP>` 後重啟 `loadtest-web`，再重新部署節點 |
 
 **查看日誌**
