@@ -127,8 +127,16 @@
         <input name="key" required maxlength="32" placeholder="hk-02">
       </label>
       <label class="field">
-        <span>主機 / IP</span>
+        <span>伺服器 IP</span>
         <input name="host" required placeholder="10.0.1.22">
+      </label>
+      <label class="field">
+        <span>SSH 使用者</span>
+        <input name="ssh_user" value="root" placeholder="root">
+      </label>
+      <label class="field">
+        <span>SSH 密碼</span>
+        <input name="ssh_password" type="password" placeholder="部署時使用" autocomplete="new-password">
       </label>
       <label class="field">
         <span>RMI 端口</span>
@@ -157,11 +165,11 @@
       <div class="form-status span2" id="node-form-status"></div>
     </div>
     <div class="form-foot">
-      <button type="button" class="btn ghost" id="btn-test-node">測試連線</button>
+      <button type="button" class="btn ghost" id="btn-test-node">測試連接</button>
       <span class="spacer"></span>
       <button type="button" class="btn" id="btn-node-cancel">取消</button>
-      <button type="submit" class="btn primary" id="btn-node-save">儲存</button>
-      <button type="button" class="btn primary" id="btn-node-save-deploy">儲存並部署</button>
+      <button type="submit" class="btn" id="btn-node-save">僅儲存</button>
+      <button type="button" class="btn primary" id="btn-node-save-deploy" disabled>開始部署節點</button>
     </div>
   </form>
 </div>

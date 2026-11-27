@@ -292,6 +292,8 @@ document.addEventListener('keydown', (event) => {
 /* ---------------------------------------------------------------- 節點表單 */
 
 const nodeForm = $('#node-form');
+let testedOk = false;
+let hasStoredCred = false;
 
 $('#btn-add-node').addEventListener('click', () => openNodeModal(null));
 $('#node-modal-close').addEventListener('click', closeNodeModal);
@@ -302,11 +304,15 @@ $('#node-modal').addEventListener('click', (event) => {
 
 function openNodeModal(key) {
   editingKey = key;
+  hasStoredCred = false;
   nodeForm.reset();
   nodeForm.port.value = '1099';
   nodeForm.ssh_port.value = '22';
   nodeForm.max_threads.value = '600';
+  nodeForm.ssh_user.value = 'root';
   nodeForm.enabled.checked = true;
+  nodeForm.ssh_password.value = '';
+  nodeForm.ssh_password.placeholder = '部署時使用';
   setFormStatus('', '');
   $('#node-modal-title').textContent = key ? `編輯伺服器 · ${key}` : '新增伺服器';
 
@@ -317,12 +323,16 @@ function openNodeModal(key) {
       nodeForm.host.value = node.host;
       nodeForm.port.value = node.port;
       nodeForm.ssh_port.value = node.ssh_port || 22;
+      nodeForm.ssh_user.value = node.ssh_user || 'root';
       nodeForm.region.value = node.region === '—' ? '' : node.region;
       nodeForm.max_threads.value = node.max_threads;
       nodeForm.note.value = node.note || '';
       nodeForm.enabled.checked = node.enabled;
+      hasStoredCred = Boolean(node.has_password);
+      if (hasStoredCred) nodeForm.ssh_password.placeholder = '已儲存，留空則沿用';
     }
   }
+  setTested(hasStoredCred);
   $('#node-modal').classList.remove('hidden');
   setTimeout(() => nodeForm.key.focus(), 50);
 }
@@ -330,6 +340,12 @@ function openNodeModal(key) {
 function closeNodeModal() {
   $('#node-modal').classList.add('hidden');
   editingKey = null;
+  testedOk = false;
+}
+
+function setTested(ok) {
+  testedOk = ok;
+  $('#btn-node-save-deploy').disabled = !ok;
 }
 
 function setFormStatus(text, cls) {
@@ -348,20 +364,37 @@ function formPayload() {
     max_threads: Number(nodeForm.max_threads.value || 600),
     enabled: nodeForm.enabled.checked,
     note: nodeForm.note.value.trim(),
+    ssh_user: nodeForm.ssh_user.value.trim() || 'root',
+    ssh_password: nodeForm.ssh_password.value,
   };
 }
+
+['host', 'ssh_user', 'ssh_password', 'ssh_port'].forEach((name) => {
+  nodeForm[name].addEventListener('input', () => {
+    if (testedOk) {
+      setTested(false);
+      setFormStatus('連線參數已變更，請重新測試連接', 'busy');
+    }
+  });
+});
 
 nodeForm.addEventListener('submit', (event) => {
   event.preventDefault();
   saveNode(false);
 });
 
-$('#btn-node-save-deploy').addEventListener('click', () => saveNode(true));
+$('#btn-node-save-deploy').addEventListener('click', () => {
+  if (!testedOk) {
+    setFormStatus('請先測試連接，成功後才能部署', 'err');
+    return;
+  }
+  saveNode(true);
+});
 
 async function saveNode(deployAfter) {
   const payload = formPayload();
   if (!payload.key || !payload.host) {
-    setFormStatus('名稱與主機為必填', 'err');
+    setFormStatus('名稱與伺服器 IP 為必填', 'err');
     return;
   }
   setFormStatus('儲存中…', 'busy');
@@ -381,35 +414,54 @@ async function saveNode(deployAfter) {
     setFormStatus(err.message, 'err');
   } finally {
     $('#btn-node-save').disabled = false;
-    $('#btn-node-save-deploy').disabled = false;
+    $('#btn-node-save-deploy').disabled = !testedOk;
   }
 }
 
 $('#btn-test-node').addEventListener('click', async () => {
   const payload = formPayload();
   if (!payload.host) {
-    setFormStatus('請先填主機位址', 'err');
+    setFormStatus('請先填伺服器 IP', 'err');
     return;
   }
-  setFormStatus('測試中…', 'busy');
+  if (!payload.ssh_password && !hasStoredCred) {
+    setFormStatus('請輸入 SSH 密碼', 'err');
+    return;
+  }
+  setTested(false);
+  setFormStatus('連接中…', 'busy');
+  $('#btn-test-node').disabled = true;
   try {
-    const result = await api('/api/probe', {
+    const result = await api('/api/ssh-test', {
       method: 'POST',
       body: JSON.stringify({
         host: payload.host,
-        port: payload.port,
         ssh_port: payload.ssh_port,
+        ssh_user: payload.ssh_user,
+        ssh_password: payload.ssh_password,
+        key: editingKey,
       }),
     });
-    const parts = [
-      result.rmi
-        ? `RMI ${payload.port} 可達（${Math.round(result.rmi_ms)} ms）`
-        : `RMI ${payload.port} 無回應`,
-      result.ssh ? `SSH ${payload.ssh_port} 可達` : `SSH ${payload.ssh_port} 不通`,
-    ];
-    setFormStatus(parts.join(' · '), result.rmi && result.ssh ? 'ok' : 'err');
+    if (!result.ok) {
+      setFormStatus(`連接失敗：${result.error}`, 'err');
+      return;
+    }
+    const bits = [`SSH 認證成功（${result.user}）`];
+    if (result.os) bits.push(result.os);
+    if (result.cpu) bits.push(`${result.cpu} 核`);
+    if (result.mem_mb) bits.push(`${(result.mem_mb / 1024).toFixed(1)} G`);
+    bits.push(result.sudo ? 'sudo 可用' : 'sudo 不可用');
+    bits.push(result.service === 'active' ? 'JMeter 已安裝' : 'JMeter 未安裝');
+    const deployable = Boolean(result.sudo);
+    setTested(deployable);
+    setFormStatus(
+      bits.join(' · ') + (deployable ? '' : '　→ 需要 root 權限才能部署'),
+      deployable ? 'ok' : 'err'
+    );
   } catch (err) {
     setFormStatus(err.message, 'err');
+  } finally {
+    $('#btn-test-node').disabled = false;
   }
 });
 

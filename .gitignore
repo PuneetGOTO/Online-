@@ -2,6 +2,7 @@
 .env
 .env.local
 .web_token
+config/credentials.json
 *.pem
 *.key
 

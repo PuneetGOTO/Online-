@@ -2,6 +2,7 @@
 
 讀取 config/nodes.json，即時探測各節點 JMeter RMI 埠判斷在線狀態，
 並透過 SSH 觸發 deploy/setup-node.sh 完成一鍵部署。
+支援金鑰認證與密碼認證（密碼以 WEB_TOKEN 派生金鑰加密存放）。
 
 啟動：
     python -m uvicorn web.app:app --host 0.0.0.0 --port 8080
@@ -11,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -37,6 +39,7 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 CONFIG_FILE = PROJECT_DIR / "config" / "nodes.json"
+CRED_FILE = PROJECT_DIR / "config" / "credentials.json"
 DEPLOY_DIR = PROJECT_DIR / "deploy"
 STATIC_DIR = BASE_DIR / "static"
 LOG_DIR = PROJECT_DIR / "results" / "deploys"
@@ -132,6 +135,71 @@ def save_config(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
     tmp.replace(CONFIG_FILE)
+
+
+# ---------------------------------------------------------------- 節點憑證
+# 密碼以 WEB_TOKEN 派生金鑰加密存放：拿到檔案但沒有權杖無法解開。
+# 換掉 WEB_TOKEN 會使既有密碼失效，需重新輸入一次。
+
+def _fernet():
+    from cryptography.fernet import Fernet
+    key = base64.urlsafe_b64encode(hashlib.sha256(WEB_TOKEN.encode()).digest())
+    return Fernet(key)
+
+
+def load_creds() -> dict:
+    if not CRED_FILE.exists():
+        return {}
+    try:
+        return json.loads(CRED_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_creds(data: dict) -> None:
+    CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CRED_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(CRED_FILE)
+    try:
+        CRED_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def store_cred(key: str, user: str, password: str) -> None:
+    data = load_creds()
+    data[key] = {
+        "user": user,
+        "password": _fernet().encrypt(password.encode()).decode(),
+    }
+    save_creds(data)
+
+
+def update_cred_user(key: str, user: str) -> None:
+    data = load_creds()
+    if key in data:
+        data[key]["user"] = user
+        save_creds(data)
+
+
+def drop_cred(key: str) -> None:
+    data = load_creds()
+    if data.pop(key, None) is not None:
+        save_creds(data)
+
+
+def get_cred(key: str) -> Optional[dict]:
+    item = load_creds().get(key)
+    if not item:
+        return None
+    try:
+        return {
+            "user": item.get("user", "root"),
+            "password": _fernet().decrypt(item["password"].encode()).decode(),
+        }
+    except Exception:
+        return None
 
 
 def _run_text(cmd: list[str], timeout: float = 10) -> str:
@@ -319,6 +387,17 @@ JOBS: dict[str, Job] = {}
 CURRENT: dict[str, Optional[Job]] = {"job": None, "last": None}
 
 
+def _classify(line: str) -> str:
+    low = line.lower()
+    if "[fail]" in low or "error" in low or "denied" in low:
+        return "err"
+    if "[warn]" in low:
+        return "warn"
+    if "[ ok ]" in low or "完成" in line:
+        return "ok"
+    return "info"
+
+
 async def stream_cmd(job: Job, cmd: list[str], timeout: float = 1800) -> int:
     job.log("$ " + " ".join(cmd), "cmd")
     try:
@@ -355,18 +434,71 @@ async def stream_cmd(job: Job, cmd: list[str], timeout: float = 1800) -> int:
                 break
             line = raw.decode("utf-8", "replace").rstrip()
             if line:
-                level = "info"
-                low = line.lower()
-                if "[fail]" in low or "error" in low or "denied" in low:
-                    level = "err"
-                elif "[warn]" in low:
-                    level = "warn"
-                elif "[ ok ]" in low or "完成" in line:
-                    level = "ok"
-                job.log(line, level)
+                job.log(line, _classify(line))
         return await proc.wait()
     finally:
         job.proc = None
+
+
+def _deploy_blocking(job: Job, emit, host: str, ssh_port: int, user: str,
+                     password: str, master_ip: str, name: str) -> bool:
+    """以密碼認證部署單一節點（阻塞，需在執行緒中呼叫）。"""
+    import paramiko
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        emit(f"$ ssh {user}@{host}:{ssh_port}（密碼認證）", "cmd")
+        client.connect(
+            host, port=ssh_port, username=user, password=password,
+            timeout=20, banner_timeout=20, auth_timeout=20,
+            allow_agent=False, look_for_keys=False,
+        )
+        emit("SSH 認證成功", "ok")
+
+        sftp = client.open_sftp()
+        sftp.put(str(DEPLOY_DIR / "setup-node.sh"), "/tmp/setup-node.sh")
+        sftp.close()
+        emit("已上傳 setup-node.sh", "ok")
+
+        prefix = "bash" if user == "root" else "sudo -S -p '' bash"
+        remote = (
+            f"chmod +x /tmp/setup-node.sh && "
+            f"{prefix} /tmp/setup-node.sh {master_ip} {host} {name}"
+        )
+        emit(f"$ {remote}", "cmd")
+        stdin, stdout, stderr = client.exec_command(remote, timeout=1800, get_pty=False)
+        if user != "root":
+            stdin.write(password + "\n")
+            stdin.flush()
+
+        for raw in iter(stdout.readline, ""):
+            if job.cancel_flag:
+                emit("使用者中止，關閉連線", "warn")
+                return False
+            line = raw.rstrip()
+            if line:
+                emit(line, _classify(line))
+
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            err = stderr.read().decode("utf-8", "replace").strip()
+            if err:
+                emit(err, "err")
+            emit(f"遠端腳本結束碼 {rc}", "err")
+            return False
+        return True
+    except paramiko.AuthenticationException:
+        emit("SSH 認證失敗：帳號或密碼錯誤", "err")
+        return False
+    except Exception as exc:
+        emit(f"部署失敗：{exc}", "err")
+        return False
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 async def deploy_one(job: Job, key: str, cfg: dict, master_ip: str) -> bool:
@@ -374,6 +506,26 @@ async def deploy_one(job: Job, key: str, cfg: dict, master_ip: str) -> bool:
     target = f"{SSH_USER}@{host}"
     job.log(f"── 節點 {key} ({host}) ──", "info")
     job.set_node(key, "連線檢查中")
+
+    cred = get_cred(key)
+    if cred:
+        job.set_node(key, "部署中（密碼）")
+        loop = asyncio.get_running_loop()
+
+        def emit(text: str, level: str = "info") -> None:
+            loop.call_soon_threadsafe(job.log, text, level)
+
+        ok = await asyncio.to_thread(
+            _deploy_blocking, job, emit, host, int(cfg.get("ssh_port", 22)),
+            cred["user"], cred["password"], master_ip, key,
+        )
+        if job.cancel_flag:
+            job.set_node(key, "已中止")
+            return False
+        job.set_node(key, "完成" if ok else "失敗")
+        if ok:
+            job.log(f"節點 {key} 部署完成", "ok")
+        return ok
 
     if not shutil.which("ssh"):
         job.log("本機找不到 ssh 指令，無法遠端部署", "err")
@@ -505,6 +657,16 @@ class NodeBody(BaseModel):
     max_threads: int = 600
     enabled: bool = True
     note: str = ""
+    ssh_user: str = "root"
+    ssh_password: Optional[str] = None
+
+
+class SshTestBody(BaseModel):
+    host: str
+    ssh_port: int = 22
+    ssh_user: str = "root"
+    ssh_password: str = ""
+    key: Optional[str] = None
 
 
 class ProbeBody(BaseModel):
@@ -515,6 +677,7 @@ class ProbeBody(BaseModel):
 
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$")
+USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
 
 
 def validate_node(body: NodeBody) -> dict:
@@ -536,6 +699,12 @@ def validate_node(body: NodeBody) -> dict:
         raise HTTPException(status_code=400, detail="SSH 端口需在 1 ~ 65535 之間")
     if not 1 <= body.max_threads <= 10000:
         raise HTTPException(status_code=400, detail="執行緒上限需在 1 ~ 10000 之間")
+    ssh_user = body.ssh_user.strip() or "root"
+    if not USER_RE.match(ssh_user):
+        raise HTTPException(status_code=400, detail="使用者名稱格式不正確")
+    password = (body.ssh_password or "").strip()
+    if password and len(password) > 256:
+        raise HTTPException(status_code=400, detail="密碼過長")
     return {
         "key": key,
         "host": host,
@@ -545,6 +714,8 @@ def validate_node(body: NodeBody) -> dict:
         "max_threads": body.max_threads,
         "enabled": body.enabled,
         "note": body.note.strip()[:200],
+        "ssh_user": ssh_user,
+        "ssh_password": password or None,
     }
 
 
@@ -577,6 +748,7 @@ async def logout():
 async def get_state(_=Depends(require_auth)):
     config = load_config()
     nodes_cfg = config.get("nodes", {})
+    creds = load_creds()
     now = time.time()
     items = []
     online = 0
@@ -593,6 +765,8 @@ async def get_state(_=Depends(require_auth)):
             "host": cfg.get("host", ""),
             "port": int(cfg.get("port", 1099)),
             "ssh_port": int(cfg.get("ssh_port", 22)),
+            "ssh_user": cfg.get("ssh_user", SSH_USER),
+            "has_password": key in creds,
             "region": cfg.get("region", "—"),
             "max_threads": int(cfg.get("max_threads", 0)),
             "enabled": bool(cfg.get("enabled", True)),
@@ -650,6 +824,7 @@ def _node_entry(data: dict) -> dict:
         "max_threads": data["max_threads"],
         "enabled": data["enabled"],
         "note": data["note"],
+        "ssh_user": data["ssh_user"],
     }
 
 
@@ -662,8 +837,11 @@ async def create_node(body: NodeBody, request: Request, _=Depends(require_auth))
         raise HTTPException(status_code=409, detail=f"節點名稱 {data['key']} 已存在")
     nodes[data["key"]] = _node_entry(data)
     save_config(config)
+    if data["ssh_password"]:
+        store_cred(data["key"], data["ssh_user"], data["ssh_password"])
     audit("NODE-ADD", request.client.host if request.client else "-",
-          f"{data['key']} {data['host']}:{data['port']} threads={data['max_threads']}")
+          f"{data['key']} {data['host']}:{data['port']} user={data['ssh_user']} "
+          f"auth={'password' if data['ssh_password'] else 'key'}")
     asyncio.create_task(probe_node(data["key"], nodes[data["key"]]))
     return {"ok": True, "key": data["key"], "nodes": len(nodes)}
 
@@ -687,9 +865,20 @@ async def update_node(key: str, body: NodeBody, request: Request, _=Depends(requ
             rebuilt[new_key if k == key else k] = _node_entry(data) if k == key else v
         config["nodes"] = rebuilt
         STATE.pop(key, None)
+        if key in load_creds():
+            creds = load_creds()
+            creds[new_key] = creds.pop(key)
+            save_creds(creds)
     save_config(config)
+
+    if data["ssh_password"]:
+        store_cred(new_key, data["ssh_user"], data["ssh_password"])
+    else:
+        update_cred_user(new_key, data["ssh_user"])
+
     audit("NODE-EDIT", request.client.host if request.client else "-",
-          f"{key}->{new_key} {data['host']}:{data['port']} threads={data['max_threads']}")
+          f"{key}->{new_key} {data['host']}:{data['port']} user={data['ssh_user']} "
+          f"threads={data['max_threads']}")
     asyncio.create_task(probe_node(new_key, config["nodes"][new_key]))
     return {"ok": True, "key": new_key, "renamed": new_key != key}
 
@@ -703,6 +892,7 @@ async def delete_node(key: str, request: Request, _=Depends(require_auth)):
     removed = nodes.pop(key)
     save_config(config)
     STATE.pop(key, None)
+    drop_cred(key)
     audit("NODE-DEL", request.client.host if request.client else "-",
           f"{key} {removed.get('host', '')}")
     return {"ok": True, "key": key, "nodes": len(nodes)}
@@ -718,6 +908,100 @@ async def probe_target(body: ProbeBody, _=Depends(require_auth)):
     rmi_ok, rmi_ms = await tcp_probe(host, body.port, timeout=4.0)
     ssh_ok, _ms = await tcp_probe(host, body.ssh_port, timeout=4.0)
     return {"rmi": rmi_ok, "rmi_ms": rmi_ms if rmi_ok else None, "ssh": ssh_ok}
+
+
+def _ssh_probe_blocking(host: str, port: int, user: str, password: str) -> dict:
+    import paramiko
+
+    info = {
+        "ok": False, "user": user, "sudo": None, "service": "unknown",
+        "os": "", "cpu": None, "mem_mb": None, "error": "",
+    }
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            host, port=port, username=user, password=password,
+            timeout=12, banner_timeout=12, auth_timeout=12,
+            allow_agent=False, look_for_keys=False,
+        )
+    except paramiko.AuthenticationException:
+        info["error"] = "帳號或密碼錯誤"
+        return info
+    except paramiko.SSHException as exc:
+        info["error"] = f"SSH 協商失敗：{exc}"
+        return info
+    except Exception as exc:
+        info["error"] = f"無法連線：{exc}"
+        return info
+
+    info["ok"] = True
+    try:
+        script = (
+            "echo @@USER; id -un; "
+            "echo @@OS; (. /etc/os-release 2>/dev/null && echo $PRETTY_NAME) || echo unknown; "
+            "echo @@CPU; nproc; "
+            "echo @@MEM; free -m | awk '/^Mem:/{print $2}'; "
+            "echo @@SVC; systemctl is-active jmeter-server 2>/dev/null || echo none"
+        )
+        _, out, _ = client.exec_command(script, timeout=15)
+        section = ""
+        for line in out.read().decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("@@"):
+                section = line[2:]
+                continue
+            if section == "OS":
+                info["os"] = line
+            elif section == "CPU":
+                info["cpu"] = int(line) if line.isdigit() else None
+            elif section == "MEM":
+                info["mem_mb"] = int(line) if line.isdigit() else None
+            elif section == "SVC":
+                info["service"] = line
+
+        _, out2, _ = client.exec_command(
+            "sudo -n true 2>/dev/null && echo yes || echo no", timeout=10
+        )
+        sudo_ok = out2.read().decode("utf-8", "replace").strip() == "yes"
+        if not sudo_ok and user != "root":
+            stdin, out3, _ = client.exec_command(
+                "sudo -S -p '' true >/dev/null 2>&1; echo RC=$?", timeout=15
+            )
+            stdin.write(password + "\n")
+            stdin.flush()
+            sudo_ok = "RC=0" in out3.read().decode("utf-8", "replace")
+        info["sudo"] = sudo_ok
+    except Exception as exc:
+        info["error"] = f"讀取系統資訊失敗：{exc}"
+    finally:
+        client.close()
+    return info
+
+
+@app.post("/api/ssh-test")
+async def ssh_test(body: SshTestBody, _=Depends(require_auth)):
+    host = body.host.strip()
+    if not HOST_RE.match(host):
+        raise HTTPException(status_code=400, detail="主機格式不正確")
+    if not 1 <= body.ssh_port <= 65535:
+        raise HTTPException(status_code=400, detail="SSH 端口需在 1 ~ 65535 之間")
+    user = (body.ssh_user or "root").strip()
+    if not USER_RE.match(user):
+        raise HTTPException(status_code=400, detail="使用者名稱格式不正確")
+
+    password = body.ssh_password or ""
+    if not password and body.key:
+        cred = get_cred(body.key)
+        if cred:
+            password = cred["password"]
+            user = cred["user"]
+    if not password:
+        raise HTTPException(status_code=400, detail="請輸入伺服器密碼")
+
+    return await asyncio.to_thread(_ssh_probe_blocking, host, body.ssh_port, user, password)
 
 
 @app.get("/api/nodes/{key}/inspect")

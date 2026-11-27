@@ -86,8 +86,9 @@ flowchart LR
 
 - 每 5 秒 TCP 探測節點 RMI 埠，即時反映在線／離線
 - 延遲走勢圖、SSH 可達性、單節點詳細檢查（服務狀態、監聽埠、硬體、負載）
-- 網頁上直接新增／編輯／刪除節點，不必手改 JSON
-- 新增後可「儲存並部署」，一台新機器從填表到上線不用離開瀏覽器
+- 網頁上直接新增／編輯／刪除節點，填 IP、SSH 帳密即可
+- 測試連接會實際登入 SSH 並回報 OS／CPU／記憶體／sudo／JMeter 狀態
+- 測試通過後一鍵部署，一台新機器從填表到上線不用離開瀏覽器
 - 一鍵部署全部節點，或單台重裝；部署輸出即時串流到頁面
 - 節點啟停用開關直接改寫 `config/nodes.json`，容量即時重算
 
@@ -390,7 +391,9 @@ WEB_TOKEN=你的權杖 .venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --
 | 欄位 | 說明 |
 |---|---|
 | 名稱 | 節點識別碼，英數字開頭，可用 `_ . -`，最長 32 字元（如 `hk-02`） |
-| 主機 / IP | 只填 IP 或域名，不要含 `http://` 或路徑 |
+| 伺服器 IP | 只填 IP 或域名，不要含 `http://` 或路徑 |
+| SSH 使用者 | 部署時登入的帳號，`root` 或具 sudo 權限的使用者（如 `ubuntu`） |
+| SSH 密碼 | 部署時使用；編輯時留空則沿用已儲存的密碼 |
 | RMI 端口 | JMeter 遠端引擎埠，預設 `1099` |
 | SSH 端口 | 部署時連線用，預設 `22` |
 | 地區 | 顯示用標籤，如 `HK`、`SG` |
@@ -398,15 +401,19 @@ WEB_TOKEN=你的權杖 .venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --
 | 備註 | 硬體規格等說明 |
 | 啟用 | 停用的節點不參與壓測與批次部署 |
 
-三個按鈕的差別：
+操作順序是 **測試連接 → 開始部署節點**：
 
-- **測試連線**：對填寫的 IP 同時探測 RMI 與 SSH 埠，確認可達再儲存。這是新增前最值得按的一下。
-- **儲存**：只寫入 `config/nodes.json`，節點會出現在清單上但顯示離線。
-- **儲存並部署**：寫入後立刻對該節點執行一次 `setup-node.sh`，裝完自動變在線。新機器用這個。
+1. **測試連接**：用填寫的帳密實際登入一次 SSH，回報作業系統、CPU 核數、記憶體、sudo 是否可用、JMeter 是否已安裝。認證失敗會直接說明是帳號密碼錯誤還是連不上。
+2. 測試通過後「開始部署節點」才會亮起。它會先儲存節點，再立刻對該機器執行 `setup-node.sh`。
+3. **僅儲存**：只寫入 `config/nodes.json`，不部署（節點會顯示離線）。
+
+改了 IP、使用者、密碼或 SSH 埠之後，部署按鈕會重新鎖上，必須再測一次——避免拿著舊憑證去部署新機器。
 
 編輯時名稱欄可以改，等於重新命名節點（會檢查新名稱是否撞名）。刪除只會從 `nodes.json` 移除，**不會**動到那台伺服器上的 `jmeter-server`。
 
-新增、編輯、刪除都會寫入 `audit.log`（`NODE-ADD` / `NODE-EDIT` / `NODE-DEL`）。
+新增、編輯、刪除都會寫入 `audit.log`（`NODE-ADD` / `NODE-EDIT` / `NODE-DEL`，只記使用者名稱，不記密碼）。
+
+**密碼怎麼存**：以 `WEB_TOKEN` 派生金鑰加密後寫入 `config/credentials.json`（權限 600，已列入 `.gitignore`）。拿到檔案但沒有權杖無法解開；換掉 `WEB_TOKEN` 會讓既有密碼失效，需要重新輸入一次。
 
 > 網址帶 `#add` 會直接開啟新增表單，方便加到書籤。
 
@@ -456,10 +463,11 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 |---|---|---|
 | `POST` | `/api/login` | 以權杖換取 session cookie |
 | `GET` | `/api/state` | 節點清單、在線狀態、容量、最近任務 |
-| `POST` | `/api/nodes` | 新增節點 |
+| `POST` | `/api/nodes` | 新增節點（可附 SSH 帳密） |
 | `PUT` | `/api/nodes/{key}` | 修改節點（`key` 變更即重新命名） |
-| `DELETE` | `/api/nodes/{key}` | 刪除節點 |
-| `POST` | `/api/probe` | 探測任意主機的 RMI / SSH 埠（新增前測試用） |
+| `DELETE` | `/api/nodes/{key}` | 刪除節點（同時清除已存憑證） |
+| `POST` | `/api/ssh-test` | 用帳密實際登入 SSH，回報 OS／CPU／記憶體／sudo／JMeter 狀態 |
+| `POST` | `/api/probe` | 探測任意主機的 RMI / SSH 埠（純 TCP，不需帳密） |
 | `POST` | `/api/nodes/{key}/enabled` | 啟用／停用節點，寫回 `nodes.json` |
 | `GET` | `/api/nodes/{key}/inspect` | SSH 讀取節點詳細狀態 |
 | `POST` | `/api/deploy` | 發起部署（`scope: all` 或 `node`） |
@@ -685,8 +693,9 @@ sudo journalctl -u jmeter-server -n 50
 4. **保護 `.env`**：Bot Token 洩漏等同他人可冒用你的 Bot 身份
 5. **定期審閱稽核日誌**：`audit.log` 中出現非預期的 `DENY` 記錄代表有人在嘗試越權
 6. **授權到期即失效**：`authorized_until` 過期後 `/loadtest` 會直接拒絕
-7. **`WEB_TOKEN` 等同節點 root 權限**：控制台能對「新增的任意 IP」用主服務器的 SSH 金鑰部署軟體。持有權杖的人可以把任意可達主機加進白名單並在其上安裝 JMeter。因此 8080 埠務必限制來源，權杖視同 root 密碼管理，離職即輪換
+7. **`WEB_TOKEN` 等同節點 root 權限**：控制台能對「新增的任意 IP」用主服務器的 SSH 金鑰或你填入的帳密部署軟體。持有權杖的人可以把任意可達主機加進白名單並在其上安裝 JMeter。因此 8080 埠務必限制來源，權杖視同 root 密碼管理，離職即輪換
 8. **新增節點後確認 IP 正確**：填錯 IP 的後果是對一台無關機器執行 `setup-node.sh`，那台機器會被裝上 JMeter 並開啟 RMI 埠
+9. **節點密碼的存在方式**：加密存放於 `config/credentials.json`（600、不進版控），金鑰由 `WEB_TOKEN` 派生。這防的是「檔案外流」，不防「主機被入侵」——入侵者能讀到 `.env` 就等於能解開所有節點密碼。因此節點帳號建議用專用帳號而非 root 的萬用密碼
 
 ### 已知限制
 
