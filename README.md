@@ -792,6 +792,25 @@ sudo journalctl -u jmeter-server -n 50
 
 ## 附屬工具
 
+### `tools/loadtest-template.jmx`
+
+用 JMeter GUI 直接打開就能跑。樹狀圖最上面是「使用者定義的變數」，改這七個值即可：
+
+| 變數 | 說明 | 預設 |
+|---|---|---|
+| `PROTOCOL` | `https` 或 `http` | https |
+| `HOST` | 目標網域，不要含 `https://` 與路徑 | example.com |
+| `PORT` | 埠號 | 443 |
+| `PATH` | 要壓的路徑 | / |
+| `THREADS` | 併發執行緒數 | 10 |
+| `RAMP_SECONDS` | 爬坡秒數 | 10 |
+| `DURATION_SECONDS` | 持續秒數 | 60 |
+
+內含 HTTP 請求、標頭管理器、回應碼斷言（2xx/3xx）、彙總報告；
+「結果樹」預設關閉，除錯時再打開。
+
+打開方式：JMeter → 檔案 → 開啟，或把 `.jmx` 直接拖進 JMeter 視窗。
+
 ### `tools/jmeter-quick-test.bat`
 
 不想開控制台、只想用手邊的 JMeter 快速壓一下時用的單檔腳本。Windows 雙擊即可。
