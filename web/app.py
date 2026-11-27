@@ -30,9 +30,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+try:  # 以 python -m uvicorn web.app:app 啟動時
+    from web import report as report_mod
+except ImportError:  # 以 python web/app.py 啟動時
+    import report as report_mod
 
 # ---------------------------------------------------------------- 路徑與設定
 
@@ -1355,6 +1360,53 @@ async def bot_action(body: BotActionBody, request: Request, _=Depends(require_au
 @app.get("/api/loadtest")
 async def get_loadtest(_=Depends(require_auth)):
     return await asyncio.to_thread(loadtest_status)
+
+
+# ---------------------------------------------------------------- 報告下載
+
+RESULTS_DIR = PROJECT_DIR / "results"
+
+
+def _result_path(stem: str) -> Path:
+    if not stem or "/" in stem or "\\" in stem or stem.startswith("."):
+        raise HTTPException(status_code=400, detail="結果名稱不合法")
+    path = RESULTS_DIR / f"{stem}.jtl"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="找不到該次結果")
+    return path
+
+
+@app.get("/api/results")
+async def list_results_api(_=Depends(require_auth)):
+    items = await asyncio.to_thread(report_mod.list_results, RESULTS_DIR, 30)
+    return {"items": items}
+
+
+@app.get("/api/results/{stem}/report")
+async def download_report(stem: str, format: str = "html", _=Depends(require_auth)):
+    path = _result_path(stem)
+    if format == "md":
+        body = await asyncio.to_thread(report_mod.render_markdown, path)
+        return Response(
+            content=body,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{stem}.md"'},
+        )
+    body = await asyncio.to_thread(report_mod.render_html, path)
+    return Response(
+        content=body,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{stem}.html"'},
+    )
+
+
+@app.get("/api/results/{stem}/raw")
+async def download_raw(stem: str, kind: str = "jtl", _=Depends(require_auth)):
+    path = _result_path(stem)
+    target = path if kind != "log" else RESULTS_DIR / f"{stem}-jmeter.log"
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="找不到該檔案")
+    return FileResponse(target, filename=target.name, media_type="application/octet-stream")
 
 
 @app.get("/api/nodes/{key}/inspect")

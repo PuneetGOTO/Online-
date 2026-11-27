@@ -778,6 +778,10 @@ function fmtNum(value) {
 function renderLoadtest(lt) {
   ltCache = lt || { state: 'idle' };
   const state = ltCache.state || 'idle';
+  if (state === 'done' && ltCache.key && ltCache.key !== lastResultsKey) {
+    lastResultsKey = ltCache.key;
+    loadResults();
+  }
   $('#lt-panel').className = 'panel lt-panel ' + state;
   $('#lt-state').textContent = LT_LABELS[state] || state;
 
@@ -844,6 +848,45 @@ setInterval(() => {
     `${duration ? Math.min(100, (elapsed / duration) * 100).toFixed(1) : 0}%`;
 }, 1000);
 
+/* ---------------------------------------------------------------- 壓測報告 */
+
+let lastResultsKey = null;
+
+async function loadResults() {
+  try {
+    const data = await api('/api/results');
+    renderResults(data.items || []);
+  } catch (err) {
+    /* 讀取失敗不影響主畫面 */
+  }
+}
+
+function renderResults(items) {
+  const box = $('#results-list');
+  $('#results-count').textContent = items.length ? `${items.length} 份` : '—';
+  if (!items.length) {
+    box.innerHTML = '<div class="results-empty">尚無測試結果</div>';
+    return;
+  }
+  box.innerHTML = items.map((item) => {
+    const stem = encodeURIComponent(item.stem);
+    const verdict = item.ok === true ? ' · 達標' : item.ok === false ? ' · 未達標' : '';
+    const threads = item.threads ? `${item.threads} 併發` : '—';
+    return `
+      <div class="result-row">
+        <div class="result-main">
+          <div class="result-title">${esc(item.domain || item.stem)}</div>
+          <div class="result-meta">${esc(item.mtime)} · ${threads} · ${item.size_kb} KB${verdict}</div>
+        </div>
+        <div class="result-actions">
+          <a class="btn small" href="/api/results/${stem}/report?format=html">報告</a>
+          <a class="btn small ghost" href="/api/results/${stem}/report?format=md">Markdown</a>
+          <a class="btn small ghost" href="/api/results/${stem}/raw?kind=jtl">原始資料</a>
+        </div>
+      </div>`;
+  }).join('');
+}
+
 /* ---------------------------------------------------------------- 啟動 */
 
 $('#btn-refresh').addEventListener('click', refreshState);
@@ -856,6 +899,8 @@ async function boot() {
     await refreshState();
     if (stateTimer) clearInterval(stateTimer);
     stateTimer = setInterval(refreshState, 5000);
+    loadResults();
+    setInterval(loadResults, 30000);
     if (location.hash === '#add') openNodeModal(null);
   } catch (err) {
     if (err.message !== 'unauth') console.warn('[boot]', err.message);

@@ -82,6 +82,15 @@ def patch_status(**fields) -> None:
         pass
 
 
+def write_meta(stem: str, data: dict) -> None:
+    """把測試參數與統計寫成 <stem>.meta.json，供報告產生使用。"""
+    try:
+        path = RESULTS_DIR / f"{stem}.meta.json"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 設定讀寫
 def _read_json(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
@@ -238,6 +247,17 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
 
     s = compute_stats(jtl)
     ok = judge(s)
+    write_meta(f"{key}-{ts}", {
+        **base,
+        "total": s["total"],
+        "err_pct": round(s["err_pct"], 2),
+        "avg_ms": round(s["avg"], 1),
+        "p50_ms": round(s["p50"], 1),
+        "p90_ms": round(s["p90"], 1),
+        "p99_ms": round(s["p99"], 1),
+        "ok": ok,
+        "ended_at": datetime.now().isoformat(timespec="seconds"),
+    })
     write_status(
         "done",
         elapsed=duration,

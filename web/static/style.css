@@ -226,6 +226,31 @@ main { max-width: 1180px; margin: 0 auto; padding: 22px 24px 64px; }
   .lt-timer { text-align: left; }
 }
 
+/* ---------------------------------------------------------------- 壓測報告 */
+.results-panel { margin-bottom: 14px; }
+.results-hint { font-size: 11.5px; color: var(--muted); }
+.results-list { padding: 4px 16px 12px; }
+.results-empty { padding: 18px 0; color: var(--muted); font-size: 12.5px; }
+.result-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line);
+}
+.result-row:last-child { border-bottom: none; }
+.result-main { flex: 1; min-width: 0; }
+.result-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.result-meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.result-actions { display: flex; gap: 6px; flex: none; }
+.result-actions .btn { text-decoration: none; }
+
 /* ---------------------------------------------------------------- 動作列 */
 .actionbar {
   display: flex;
