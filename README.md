@@ -787,3 +787,19 @@ sudo journalctl -u jmeter-server -n 50
 ## 授權
 
 本專案為私有商業工具，未附帶開源授權條款。未經授權不得再散布或用於對未授權目標的壓力測試。
+
+---
+
+## 附屬工具
+
+### `tools/jmeter-quick-test.bat`
+
+不想開控制台、只想用手邊的 JMeter 快速壓一下時用的單檔腳本。Windows 雙擊即可。
+
+- 自動尋找 JMeter（PATH、`%JMETER_HOME%`、`C://apache-jmeter-*`、`%USERPROFILE%\apache-jmeter-*`、`D://`），找不到會請你貼路徑
+- 依序問：目標網址 → 併發數 → 持續秒數（Enter 用 60）
+- 顯示摘要後要打 `Y` 才開始，避免手滑
+- 自動產生計畫檔（GET、跟隨重導向、連線逾時 10s / 回應逾時 30s）
+- 結果輸出到 `tools/runs/<時間>/`：`plan.jmx`、`result.jtl`、`report/index.html`（跑完自動開啟）
+
+網址可以只寫 `example.com/path`，會自動補 `https://`；帶埠號 `http://host:8080/x` 也認得。
