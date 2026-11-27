@@ -2,6 +2,8 @@
 
 以 Discord 為控制介面的分散式壓力測試平台。控制平面負責授權、目標驗證與任務分派，多台 Ubuntu 節點作為 JMeter 遠端引擎產生流量，結果自動彙總為統計報告。
 
+另附一套**網頁控制台**（`web/`）：在同一個瀏覽器頁面看到所有節點的在線狀態、延遲走勢與容量，並可一鍵部署全部伺服器。
+
 > **這個專案要求目標域名必須通過所有權驗證。** 未經驗證的域名不會產生任何流量。詳見 [安全性與合規](#安全性與合規)。
 
 ---
@@ -19,6 +21,7 @@
   - [步驟 3：設定 .env](#步驟-3設定-env)
   - [步驟 4：部署壓測節點](#步驟-4部署壓測節點)
   - [步驟 5：驗證部署](#步驟-5驗證部署)
+- [網頁控制台](#網頁控制台)
 - [使用流程](#使用流程)
 - [指令一覽](#指令一覽)
 - [配置說明](#配置說明)
@@ -33,10 +36,13 @@
 ```mermaid
 flowchart LR
     U["Discord<br/>OWNER / STAFF"] -->|slash command| B["控制平面<br/>bot.py"]
+    W["網頁控制台<br/>web/app.py :8080"] -->|"SSH 部署<br/>TCP 探測 1099"| N1
+    W -->|讀寫| C["config/nodes.json"]
     B -->|核准與授權| B
     B -->|"DNS TXT / HTTP<br/>所有權驗證"| T["目標站點"]
     B -->|"RMI 1099"| N1["節點 hk-01<br/>jmeter-server"]
     B -->|"RMI 1099"| N2["節點 sg-01<br/>jmeter-server"]
+    W -->|"SSH 部署"| N2
     N1 ==>|"壓測流量"| T
     N2 ==>|"壓測流量"| T
     B -.->|"彙總 jtl"| R["統計報告"]
@@ -45,10 +51,11 @@ flowchart LR
 | 元件 | 角色 | 說明 |
 |---|---|---|
 | 控制平面 | Discord Bot | 權限檢查、目標驗證、節點分配、結果統計 |
+| 網頁控制台 | 節點運維 UI | 節點在線狀態、一鍵部署、部署日誌串流 |
 | 壓測節點 | JMeter Server | 接收計畫並產生流量，可水平擴充 |
 | 目標站點 | 待測系統 | 必須先通過所有權驗證 |
 
-控制平面本身不產生流量，只負責下發 JMeter 計畫（`-R` 指定節點）與收集結果。
+控制平面本身不產生流量，只負責下發 JMeter 計畫（`-R` 指定節點）與收集結果。網頁控制台只做節點運維，**不參與壓測授權流程**——壓測仍然只能從 Discord 由 OWNER 核准發起。
 
 ---
 
@@ -75,6 +82,13 @@ flowchart LR
 - 爬升期自動限制在測試時長的三分之一內
 - 執行中每 10 秒更新進度，支援隨時中止
 
+**節點運維（網頁控制台）**
+
+- 每 5 秒 TCP 探測節點 RMI 埠，即時反映在線／離線
+- 延遲走勢圖、SSH 可達性、單節點詳細檢查（服務狀態、監聽埠、硬體、負載）
+- 一鍵部署全部節點，或單台重裝；部署輸出即時串流到頁面
+- 節點啟停用開關直接改寫 `config/nodes.json`，容量即時重算
+
 ---
 
 ## 目錄結構
@@ -93,6 +107,13 @@ flowchart LR
 │   ├── setup-master.sh     # 主服務器一鍵部署
 │   ├── setup-node.sh       # 單一節點一鍵部署
 │   └── deploy-nodes.sh     # 從主服務器批次部署所有節點
+├── web/
+│   ├── app.py              # 網頁控制台後端（FastAPI）
+│   ├── requirements.txt
+│   └── static/             # 前端（無需建置）
+│       ├── index.html
+│       ├── style.css
+│       └── app.js
 ├── plans/
 │   └── baseline.jmx        # 預設壓測計畫
 ├── results/                # 執行結果（不進版控）
@@ -180,9 +201,11 @@ sudo ./setup-master.sh
 | JMeter | 下載 5.6.3 至 `/opt/jmeter`，設定 `server.rmi.ssl.disable=true` |
 | 服務帳號 | 建立 `loadtest` 系統使用者 |
 | 檔案同步 | 專案複製到 `/opt/loadtest-platform`（排除 `.env`、`results`、`audit.log`） |
-| Python 環境 | 建立 `.venv` 並安裝 `discord.py`、`aiohttp`、`dnspython` |
-| systemd | 註冊 `loadtest-bot` 服務（開機自啟、異常自動重啟） |
-| 防火牆 | 放行 1099 / 4000 |
+| Python 環境 | 建立 `.venv` 並安裝 `discord.py`、`aiohttp`、`dnspython`、`fastapi`、`uvicorn` |
+| systemd | 註冊 `loadtest-bot` 與 `loadtest-web`（開機自啟、異常自動重啟） |
+| SSH 金鑰 | 複製 root 的節點金鑰給 `loadtest` 使用者（Web 控制台部署節點用） |
+| 存取權杖 | 自動產生 `WEB_TOKEN` 寫入 `.env`，並在結尾印出 |
+| 防火牆 | 放行 1099 / 4000 / 8080 |
 
 腳本可重複執行，已安裝的元件會跳過。
 
@@ -210,6 +233,10 @@ GUILD_ID=<步驟 1.3 的伺服器 ID>
 | `STAFF_IDS` | 否 | 安全人員，可提交目標、驗證所有權、在核准範圍內發起壓測 |
 | `GUILD_ID` | 建議 | 填入後斜線指令立即生效；不填為全域指令，最多需等 1 小時 |
 | `JMETER_BIN` | 自動 | 由部署腳本自動填入 `/opt/jmeter/bin/jmeter` |
+| `WEB_TOKEN` | 自動 | 網頁控制台存取權杖，部署腳本自動產生 |
+| `WEB_PORT` | 否 | 控制台埠號，預設 `8080` |
+| `SSH_USER` | 否 | 控制台部署節點時使用的 SSH 帳號，預設 `root` |
+| `MASTER_IP` | 否 | 主服務器對外 IP，留空自動偵測 |
 
 啟動服務：
 
@@ -306,13 +333,106 @@ sudo systemctl restart loadtest-bot
 
 應顯示所有節點「在線」，footer 顯示有效容量。
 
-**5.3 節點端診斷（若顯示離線）**
+**5.3 在網頁控制台檢查**
+
+瀏覽器開啟 `http://<主服務器IP>:8080`，輸入 `.env` 中的 `WEB_TOKEN`。頁面應顯示所有節點為綠色在線，並給出有效容量。
+
+**5.4 節點端診斷（若顯示離線）**
 
 ```bash
 systemctl status jmeter-server
 ss -lnt | grep -E '1099|4000'
 journalctl -u jmeter-server -n 50
 ```
+
+---
+
+## 網頁控制台
+
+`web/` 是一個獨立的 FastAPI 服務，與 Discord Bot 共用同一份 `config/nodes.json`。它**只做節點運維**，不涉及壓測授權——壓測仍然只能在 Discord 由 OWNER 核准發起。
+
+### 啟動方式
+
+部署主服務器時已自動註冊為 systemd 服務：
+
+```bash
+sudo systemctl status loadtest-web
+sudo systemctl restart loadtest-web
+tail -f /opt/loadtest-platform/logs/web.log
+```
+
+手動啟動（開發用）：
+
+```bash
+cd /opt/loadtest-platform
+WEB_TOKEN=你的權杖 .venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --port 8080
+```
+
+首次啟動若未設定 `WEB_TOKEN`，會自動產生並寫入專案根目錄的 `.web_token`，同時印在日誌裡。
+
+### 頁面功能
+
+| 區域 | 內容 |
+|---|---|
+| 頂部狀態 | 在線節點數、有效容量、主服務器 IP、JMeter 版本 |
+| 統計卡 | 在線節點、有效併發容量、主服務器、最後更新時間 |
+| 節點卡 | 狀態燈、延遲、執行緒上限、最近檢查時間、延遲走勢圖、啟停用開關 |
+| 節點卡按鈕 | 「檢查」讀取遠端服務狀態／監聽埠／硬體／負載；「部署」重裝該節點 |
+| 一鍵部署 | 對所有啟用節點依序執行 `setup-node.sh`，可勾選含停用節點 |
+| 部署輸出 | 即時串流 SSH 輸出，錯誤行標紅，可中止 |
+
+### 在線判定方式
+
+- **每 5 秒**對節點 RMI 埠（預設 1099）發起 TCP 連線，成功即視為在線，並記錄握手延遲
+- **每 20 秒**額外探測 SSH 埠（22），用於提示「可部署性」
+- 節點卡上的延遲走勢保留最近 40 個採樣點
+
+這是**埠層面的存活判斷**，不代表 `jmeter-server` 真的能接任務。要確認服務本身，按節點卡上的「檢查」，它會 SSH 進去執行 `systemctl is-active jmeter-server`、`ss -lnt`、`jmeter -v`。
+
+### 部署流程
+
+按下「一鍵部署全部節點」後，後端依序對每個節點執行：
+
+```
+ssh root@<節點> true                          # 連線預檢
+scp deploy/setup-node.sh root@<節點>:/tmp/   # 傳送腳本
+ssh root@<節點> "chmod +x /tmp/setup-node.sh && \
+                 sudo -n bash /tmp/setup-node.sh <master_ip> <node_ip> <node_name>"
+```
+
+- 單一任務序列執行，不並行（避免同時重啟多台造成壓測中斷）
+- 同一時間只允許一個部署任務，重複提交會回 409
+- 任一台失敗不中斷其餘節點，最後彙總成功／失敗數
+- `setup-node.sh` 本身可重複執行，已安裝的元件會跳過
+
+### 存取控制
+
+| 機制 | 說明 |
+|---|---|
+| 權杖登入 | `WEB_TOKEN` 以 HMAC 簽章寫入 HttpOnly Cookie，有效期 12 小時 |
+| 常數時間比對 | 使用 `hmac.compare_digest`，避免時序側信道 |
+| 稽核 | 登入、登入失敗、部署、中止、節點啟停用全部寫入 `audit.log` |
+| 無使用者系統 | 不存帳號密碼，只有一組共用權杖；適合內部運維 |
+
+> 這個頁面能對伺服器執行 root 級部署，**不要直接暴露在公網**。建議用 `ufw` 限制來源 IP，或放在 VPN / 跳板機之後。
+
+```bash
+sudo ufw delete allow 8080/tcp
+sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
+```
+
+### 相關 API
+
+| 方法 | 路徑 | 說明 |
+|---|---|---|
+| `POST` | `/api/login` | 以權杖換取 session cookie |
+| `GET` | `/api/state` | 節點清單、在線狀態、容量、最近任務 |
+| `POST` | `/api/nodes/{key}/enabled` | 啟用／停用節點，寫回 `nodes.json` |
+| `GET` | `/api/nodes/{key}/inspect` | SSH 讀取節點詳細狀態 |
+| `POST` | `/api/deploy` | 發起部署（`scope: all` 或 `node`） |
+| `GET` | `/api/jobs/{id}` | 任務狀態與輸出 |
+| `POST` | `/api/jobs/{id}/cancel` | 中止任務 |
+| `GET` | `/api/jobs/{id}/stream` | SSE 即時輸出 |
 
 ---
 
@@ -477,6 +597,12 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 | Bot 無回應 | Token 錯誤或過期 | 重新產生 Token 並更新 `.env` |
 | | 未填 `GUILD_ID` 導致指令尚未同步 | 填入 `GUILD_ID` 並重啟 |
 | | 缺少 `applications.commands` scope | 重新用正確 URL 邀請 Bot |
+| 控制台顯示全部離線 | 節點未部署或 `jmeter-server` 未啟動 | 按「一鍵部署全部節點」，或看節點 `systemctl status jmeter-server` |
+| | 探測的是 RMI 埠，被防火牆擋 | 節點需放行主服務器 IP 的 1099 |
+| 控制台「SSH 不通」 | `loadtest` 使用者沒有節點金鑰 | `sudo -u loadtest ssh-copy-id root@<節點IP>` |
+| 部署報 `sudo: a password is required` | 節點 sudo 需要密碼 | 節點加 `NOPASSWD`，或把 `SSH_USER` 設為 `root` |
+| 控制台無法登入 | `WEB_TOKEN` 不符 | 看 `/opt/loadtest-platform/.env` 的 `WEB_TOKEN` |
+| 控制台 502 / 連不上 | 服務未啟動或防火牆 | `systemctl status loadtest-web`、`ufw status` |
 
 **查看日誌**
 
@@ -484,6 +610,10 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 # 控制平面
 sudo journalctl -u loadtest-bot -n 50
 tail -f /opt/loadtest-platform/logs/bot.log
+
+# 網頁控制台
+sudo journalctl -u loadtest-web -n 50
+tail -f /opt/loadtest-platform/logs/web.log
 
 # 節點
 sudo journalctl -u jmeter-server -n 50

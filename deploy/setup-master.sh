@@ -83,8 +83,9 @@ if [ ! -x "${INSTALL_DIR}/.venv/bin/python" ]; then
 fi
 "${INSTALL_DIR}/.venv/bin/pip" install -q --upgrade pip
 "${INSTALL_DIR}/.venv/bin/pip" install -q -r "${INSTALL_DIR}/requirements.txt"
+"${INSTALL_DIR}/.venv/bin/pip" install -q -r "${INSTALL_DIR}/web/requirements.txt"
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}/.venv"
-c_ok "依賴安裝完成（discord.py / aiohttp / dnspython）"
+c_ok "依賴安裝完成（discord.py / aiohttp / dnspython / fastapi / uvicorn）"
 
 # ---------------------------------------------------------------- 5. .env
 if [ ! -f "${INSTALL_DIR}/.env" ]; then
@@ -98,6 +99,45 @@ else
   sed -i "s|^JMETER_BIN=.*|JMETER_BIN=${JMETER_HOME}/bin/jmeter|" "${INSTALL_DIR}/.env"
   NEEDS_ENV=0
 fi
+
+# ---------------------------------------------------------------- 5.5 Web 控制台前置
+WEB_PORT="${WEB_PORT:-8080}"
+LHOME="$(getent passwd "${SERVICE_USER}" | cut -d: -f6)"
+mkdir -p "${LHOME}/.ssh"
+chmod 700 "${LHOME}/.ssh"
+
+# Web 控制台以 loadtest 身分執行 ssh，沿用 root 的節點金鑰
+KEY_SRC=""
+for k in id_ed25519 id_rsa; do
+  if [ -f "/root/.ssh/${k}" ]; then KEY_SRC="/root/.ssh/${k}"; break; fi
+done
+if [ -n "${KEY_SRC}" ]; then
+  cp -f "${KEY_SRC}" "${LHOME}/.ssh/" 2>/dev/null || true
+  cp -f "${KEY_SRC}.pub" "${LHOME}/.ssh/" 2>/dev/null || true
+  c_ok "已複製 SSH 金鑰給 ${SERVICE_USER}（Web 部署節點需要）"
+else
+  c_warn "root 沒有 SSH 金鑰，Web 控制台將無法部署節點。請執行："
+  c_warn "  ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 && ssh-copy-id root@<節點IP>"
+fi
+if [ -f /root/.ssh/known_hosts ]; then
+  cp -f /root/.ssh/known_hosts "${LHOME}/.ssh/" 2>/dev/null || true
+fi
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${LHOME}/.ssh"
+chmod 600 "${LHOME}/.ssh"/id_* 2>/dev/null || true
+chmod 644 "${LHOME}/.ssh"/*.pub 2>/dev/null || true
+
+# 產生 Web 存取權杖（已存在則沿用）
+if ! grep -q '^WEB_TOKEN=.\+' "${INSTALL_DIR}/.env" 2>/dev/null; then
+  WEB_TOKEN_VAL="$(openssl rand -hex 16 2>/dev/null \
+    || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  if grep -q '^WEB_TOKEN=' "${INSTALL_DIR}/.env" 2>/dev/null; then
+    sed -i "s|^WEB_TOKEN=.*|WEB_TOKEN=${WEB_TOKEN_VAL}|" "${INSTALL_DIR}/.env"
+  else
+    echo "WEB_TOKEN=${WEB_TOKEN_VAL}" >> "${INSTALL_DIR}/.env"
+  fi
+  c_ok "已生成 Web 存取權杖"
+fi
+WEB_TOKEN_SHOW="$(grep '^WEB_TOKEN=' "${INSTALL_DIR}/.env" | head -1 | cut -d= -f2-)"
 
 # ---------------------------------------------------------------- 6. systemd
 c_info "安裝 systemd 服務"
@@ -125,9 +165,39 @@ systemctl daemon-reload
 systemctl enable loadtest-bot >/dev/null
 c_ok "服務已註冊（loadtest-bot）"
 
+cat > /etc/systemd/system/loadtest-web.service <<EOF
+[Unit]
+Description=Load Test Platform · Node Console (Web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+WorkingDirectory=${INSTALL_DIR}
+Environment="PYTHONUNBUFFERED=1"
+Environment="WEB_PORT=${WEB_PORT}"
+Environment="SSH_USER=${SSH_USER:-root}"
+ExecStart=${INSTALL_DIR}/.venv/bin/python -m uvicorn web.app:app --host 0.0.0.0 --port ${WEB_PORT}
+Restart=always
+RestartSec=5
+StandardOutput=append:${INSTALL_DIR}/logs/web.log
+StandardError=append:${INSTALL_DIR}/logs/web.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable loadtest-web >/dev/null
+c_ok "服務已註冊（loadtest-web）"
+
 # ---------------------------------------------------------------- 7. 防火牆
 ufw allow "${RMI_PORT}/tcp" comment 'jmeter master rmi' >/dev/null 2>&1 || true
 ufw allow "${RMI_LOCAL_PORT}/tcp" comment 'jmeter master rmi data' >/dev/null 2>&1 || true
+ufw allow "${WEB_PORT}/tcp" comment 'loadtest web console' >/dev/null 2>&1 || true
+c_warn "已放行 ${WEB_PORT}/tcp。控制台可部署伺服器，建議限制來源："
+c_warn "  sudo ufw delete allow ${WEB_PORT}/tcp"
+c_warn "  sudo ufw allow from <你的辦公IP> to any port ${WEB_PORT} proto tcp"
 
 # ---------------------------------------------------------------- 8. 啟動
 echo ""
@@ -147,6 +217,15 @@ else
   fi
 fi
 
+# Web 控制台不依賴 Discord，直接啟動
+systemctl restart loadtest-web
+sleep 2
+if systemctl is-active --quiet loadtest-web; then
+  c_ok "Web 控制台已啟動：http://${SELF_IP}:${WEB_PORT}"
+else
+  c_err "Web 控制台啟動失敗，請看：journalctl -u loadtest-web -n 50"
+fi
+
 cat <<EOF
 
 ===============================================
@@ -158,13 +237,18 @@ cat <<EOF
  節點清單 : ${INSTALL_DIR}/config/nodes.json
  稽核日誌 : ${INSTALL_DIR}/audit.log
 
+ Web 控制台 : http://${SELF_IP}:${WEB_PORT}
+ 存取權杖   : ${WEB_TOKEN_SHOW}
+ （也可在 .env 的 WEB_TOKEN 修改）
+
  常用指令：
+   sudo systemctl status loadtest-web
+   sudo systemctl restart loadtest-web
+   tail -f ${INSTALL_DIR}/logs/web.log
    sudo systemctl status loadtest-bot
-   sudo systemctl restart loadtest-bot
-   tail -f ${INSTALL_DIR}/logs/bot.log
 
  下一步：
    1. 填寫 .env（DISCORD_TOKEN / OWNER_ID / STAFF_IDS / GUILD_ID）
-   2. 部署節點：sudo ./deploy-nodes.sh
-   3. 把節點寫進 config/nodes.json 後重啟 bot
+   2. 開啟 Web 控制台，按「一鍵部署全部節點」
+   3. 節點上線後即可在控制台看到在線狀態
 EOF

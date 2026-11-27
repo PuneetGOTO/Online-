@@ -1,6 +1,7 @@
 # 機密憑證（絕對不可提交）
 .env
 .env.local
+.web_token
 *.pem
 *.key
 

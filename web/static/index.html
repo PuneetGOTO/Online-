@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>節點控制台 · 壓測平台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 登入層 -->
+<div id="login" class="login hidden">
+  <form class="login-card" id="login-form">
+    <div class="brand-mark">LT</div>
+    <h1>節點控制台</h1>
+    <p class="muted">此頁可部署伺服器，需存取權杖</p>
+    <input id="token" type="password" placeholder="WEB_TOKEN" autocomplete="current-password" required>
+    <button type="submit" class="btn primary wide">登入</button>
+    <p id="login-error" class="err-text"></p>
+  </form>
+</div>
+
+<!-- 主介面 -->
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark small">LT</div>
+      <div>
+        <h1>節點控制台</h1>
+        <p class="sub" id="server-line">載入中…</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="chip" id="chip-online">— 在線</span>
+      <span class="chip" id="chip-capacity">容量 —</span>
+      <button class="btn ghost small" id="btn-refresh">重新整理</button>
+      <button class="btn ghost small" id="btn-logout">登出</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 統計 -->
+    <section class="stats">
+      <div class="stat">
+        <span class="stat-label">在線節點</span>
+        <span class="stat-value" id="stat-online">—</span>
+        <span class="stat-hint" id="stat-online-hint">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">有效併發容量</span>
+        <span class="stat-value" id="stat-capacity">—</span>
+        <span class="stat-hint">min(節點上限) × 節點數</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">主服務器</span>
+        <span class="stat-value mono" id="stat-master">—</span>
+        <span class="stat-hint" id="stat-jmeter">JMeter —</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">最後更新</span>
+        <span class="stat-value mono" id="stat-time">—</span>
+        <span class="stat-hint">每 5 秒自動探測</span>
+      </div>
+    </section>
+
+    <!-- 動作列 -->
+    <section class="actionbar">
+      <div class="actionbar-left">
+        <button class="btn primary" id="btn-deploy-all">
+          <span class="bolt">⚡</span> 一鍵部署全部節點
+        </button>
+        <label class="check">
+          <input type="checkbox" id="include-disabled">
+          <span>含已停用節點</span>
+        </label>
+      </div>
+      <p class="actionbar-hint" id="action-hint">
+        透過 SSH 執行 <code>deploy/setup-node.sh</code>，可重複執行，已安裝的會跳過。
+      </p>
+    </section>
+
+    <!-- 節點 -->
+    <section class="section-head">
+      <h2>伺服器節點</h2>
+      <span class="muted" id="node-count"></span>
+    </section>
+    <section class="grid" id="node-grid"></section>
+
+    <!-- 部署輸出 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>部署輸出</h2>
+        <span class="chip" id="job-chip">閒置</span>
+        <span class="spacer"></span>
+        <button class="btn ghost small hidden" id="btn-cancel">中止</button>
+        <button class="btn ghost small" id="btn-clear-log">清空</button>
+      </div>
+      <div class="log" id="log">
+        <div class="log-empty">尚無部署任務。按上方「一鍵部署全部節點」開始。</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 檢查結果 -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 id="modal-title">節點檢查</h3>
+      <button class="icon-btn" id="modal-close">×</button>
+    </div>
+    <pre id="modal-body">檢查中…</pre>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
