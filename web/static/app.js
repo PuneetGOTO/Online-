@@ -1,7 +1,11 @@
 const $ = (sel) => document.querySelector(sel);
 
+const ICON_EDIT = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M11.2 2.1l2.7 2.7-8.3 8.3-3.5.8.8-3.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
+const ICON_TRASH = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M3 4.6h10M6.4 4.6V3.1h3.2v1.5M4.6 4.6l.6 8.3h5.6l.6-8.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+
 let latestState = null;
 let activeJobId = null;
+let editingKey = null;
 let jobTimer = null;
 let stateTimer = null;
 let renderedLines = 0;
@@ -146,7 +150,10 @@ function sparkline(history) {
 function renderNodes(nodes, job) {
   const grid = $('#node-grid');
   if (!nodes.length) {
-    grid.innerHTML = '<div class="panel" style="padding:20px;color:var(--muted)">config/nodes.json 中沒有節點。加入節點後重新整理。</div>';
+    grid.innerHTML = `<div class="empty-state">
+      <div>還沒有任何伺服器節點</div>
+      <button class="btn primary" data-act="add">新增第一台伺服器</button>
+    </div>`;
     return;
   }
 
@@ -186,7 +193,13 @@ function renderNodes(nodes, job) {
             <span class="slider"></span>
           </label>
         </div>
-        <div class="node-host mono">${esc(node.host)}:${node.port}</div>
+        <div class="node-host">
+          <span class="addr mono">${esc(node.host)}:${node.port}</span>
+          <span class="host-actions">
+            <button class="icon-mini" data-act="edit" data-key="${esc(node.key)}" title="編輯">${ICON_EDIT}</button>
+            <button class="icon-mini danger" data-act="delete" data-key="${esc(node.key)}" title="刪除">${ICON_TRASH}</button>
+          </span>
+        </div>
         <div class="node-metrics">
           <div class="metric">
             <span class="k">延遲</span>
@@ -224,6 +237,12 @@ $('#node-grid').addEventListener('click', async (event) => {
     await startDeploy({ scope: 'node', key });
   } else if (act === 'inspect') {
     await inspectNode(key);
+  } else if (act === 'edit') {
+    openNodeModal(key);
+  } else if (act === 'delete') {
+    await deleteNode(key);
+  } else if (act === 'add') {
+    openNodeModal(null);
   }
 });
 
@@ -264,8 +283,145 @@ $('#modal').addEventListener('click', (event) => {
   if (event.target.id === 'modal') $('#modal').classList.add('hidden');
 });
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') $('#modal').classList.add('hidden');
+  if (event.key === 'Escape') {
+    $('#modal').classList.add('hidden');
+    closeNodeModal();
+  }
 });
+
+/* ---------------------------------------------------------------- 節點表單 */
+
+const nodeForm = $('#node-form');
+
+$('#btn-add-node').addEventListener('click', () => openNodeModal(null));
+$('#node-modal-close').addEventListener('click', closeNodeModal);
+$('#btn-node-cancel').addEventListener('click', closeNodeModal);
+$('#node-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'node-modal') closeNodeModal();
+});
+
+function openNodeModal(key) {
+  editingKey = key;
+  nodeForm.reset();
+  nodeForm.port.value = '1099';
+  nodeForm.ssh_port.value = '22';
+  nodeForm.max_threads.value = '600';
+  nodeForm.enabled.checked = true;
+  setFormStatus('', '');
+  $('#node-modal-title').textContent = key ? `編輯伺服器 · ${key}` : '新增伺服器';
+
+  if (key && latestState) {
+    const node = latestState.nodes.find((item) => item.key === key);
+    if (node) {
+      nodeForm.key.value = node.key;
+      nodeForm.host.value = node.host;
+      nodeForm.port.value = node.port;
+      nodeForm.ssh_port.value = node.ssh_port || 22;
+      nodeForm.region.value = node.region === '—' ? '' : node.region;
+      nodeForm.max_threads.value = node.max_threads;
+      nodeForm.note.value = node.note || '';
+      nodeForm.enabled.checked = node.enabled;
+    }
+  }
+  $('#node-modal').classList.remove('hidden');
+  setTimeout(() => nodeForm.key.focus(), 50);
+}
+
+function closeNodeModal() {
+  $('#node-modal').classList.add('hidden');
+  editingKey = null;
+}
+
+function setFormStatus(text, cls) {
+  const element = $('#node-form-status');
+  element.textContent = text;
+  element.className = 'form-status span2' + (cls ? ' ' + cls : '');
+}
+
+function formPayload() {
+  return {
+    key: nodeForm.key.value.trim(),
+    host: nodeForm.host.value.trim(),
+    port: Number(nodeForm.port.value || 1099),
+    ssh_port: Number(nodeForm.ssh_port.value || 22),
+    region: nodeForm.region.value.trim(),
+    max_threads: Number(nodeForm.max_threads.value || 600),
+    enabled: nodeForm.enabled.checked,
+    note: nodeForm.note.value.trim(),
+  };
+}
+
+nodeForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  saveNode(false);
+});
+
+$('#btn-node-save-deploy').addEventListener('click', () => saveNode(true));
+
+async function saveNode(deployAfter) {
+  const payload = formPayload();
+  if (!payload.key || !payload.host) {
+    setFormStatus('名稱與主機為必填', 'err');
+    return;
+  }
+  setFormStatus('儲存中…', 'busy');
+  $('#btn-node-save').disabled = true;
+  $('#btn-node-save-deploy').disabled = true;
+  try {
+    const saved = editingKey
+      ? await api(`/api/nodes/${encodeURIComponent(editingKey)}`, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        })
+      : await api('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
+    closeNodeModal();
+    await refreshState();
+    if (deployAfter) await startDeploy({ scope: 'node', key: saved.key });
+  } catch (err) {
+    setFormStatus(err.message, 'err');
+  } finally {
+    $('#btn-node-save').disabled = false;
+    $('#btn-node-save-deploy').disabled = false;
+  }
+}
+
+$('#btn-test-node').addEventListener('click', async () => {
+  const payload = formPayload();
+  if (!payload.host) {
+    setFormStatus('請先填主機位址', 'err');
+    return;
+  }
+  setFormStatus('測試中…', 'busy');
+  try {
+    const result = await api('/api/probe', {
+      method: 'POST',
+      body: JSON.stringify({
+        host: payload.host,
+        port: payload.port,
+        ssh_port: payload.ssh_port,
+      }),
+    });
+    const parts = [
+      result.rmi
+        ? `RMI ${payload.port} 可達（${Math.round(result.rmi_ms)} ms）`
+        : `RMI ${payload.port} 無回應`,
+      result.ssh ? `SSH ${payload.ssh_port} 可達` : `SSH ${payload.ssh_port} 不通`,
+    ];
+    setFormStatus(parts.join(' · '), result.rmi && result.ssh ? 'ok' : 'err');
+  } catch (err) {
+    setFormStatus(err.message, 'err');
+  }
+});
+
+async function deleteNode(key) {
+  if (!confirm(`刪除節點 ${key}？\n\n只會從 nodes.json 移除，不會動到那台伺服器上的 jmeter-server。`)) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(key)}`, { method: 'DELETE' });
+    await refreshState();
+  } catch (err) {
+    alert(`刪除失敗：${err.message}`);
+  }
+}
 
 /* ---------------------------------------------------------------- 部署 */
 
@@ -390,6 +546,7 @@ async function boot() {
     await refreshState();
     if (stateTimer) clearInterval(stateTimer);
     stateTimer = setInterval(refreshState, 5000);
+    if (location.hash === '#add') openNodeModal(null);
   } catch (err) {
     if (err.message !== 'unauth') console.warn('[boot]', err.message);
   }

@@ -66,6 +66,7 @@
     <!-- 動作列 -->
     <section class="actionbar">
       <div class="actionbar-left">
+        <button class="btn" id="btn-add-node">新增伺服器</button>
         <button class="btn primary" id="btn-deploy-all">
           <span class="bolt">⚡</span> 一鍵部署全部節點
         </button>
@@ -111,6 +112,58 @@
     </div>
     <pre id="modal-body">檢查中…</pre>
   </div>
+</div>
+
+<!-- 新增／編輯伺服器 -->
+<div id="node-modal" class="modal hidden">
+  <form class="modal-card form-card" id="node-form" autocomplete="off">
+    <div class="modal-head">
+      <h3 id="node-modal-title">新增伺服器</h3>
+      <button type="button" class="icon-btn" id="node-modal-close">×</button>
+    </div>
+    <div class="form-body">
+      <label class="field">
+        <span>名稱</span>
+        <input name="key" required maxlength="32" placeholder="hk-02">
+      </label>
+      <label class="field">
+        <span>主機 / IP</span>
+        <input name="host" required placeholder="10.0.1.22">
+      </label>
+      <label class="field">
+        <span>RMI 端口</span>
+        <input name="port" type="number" min="1" max="65535" value="1099">
+      </label>
+      <label class="field">
+        <span>SSH 端口</span>
+        <input name="ssh_port" type="number" min="1" max="65535" value="22">
+      </label>
+      <label class="field">
+        <span>地區</span>
+        <input name="region" maxlength="16" placeholder="HK">
+      </label>
+      <label class="field">
+        <span>執行緒上限</span>
+        <input name="max_threads" type="number" min="1" max="10000" value="600">
+      </label>
+      <label class="field span2">
+        <span>備註</span>
+        <input name="note" maxlength="200" placeholder="4 vCPU / 8G">
+      </label>
+      <label class="check span2">
+        <input type="checkbox" name="enabled" checked>
+        <span>啟用此節點（停用後不參與壓測與批次部署）</span>
+      </label>
+      <div class="form-status span2" id="node-form-status"></div>
+    </div>
+    <div class="form-foot">
+      <button type="button" class="btn ghost" id="btn-test-node">測試連線</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="btn-node-cancel">取消</button>
+      <button type="submit" class="btn primary" id="btn-node-save">儲存</button>
+      <button type="button" class="btn primary" id="btn-node-save-deploy">儲存並部署</button>
+    </div>
+  </form>
 </div>
 
 <script src="/static/app.js"></script>

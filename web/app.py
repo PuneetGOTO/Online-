@@ -496,6 +496,58 @@ class ToggleBody(BaseModel):
     enabled: bool
 
 
+class NodeBody(BaseModel):
+    key: str
+    host: str
+    port: int = 1099
+    ssh_port: int = 22
+    region: str = "—"
+    max_threads: int = 600
+    enabled: bool = True
+    note: str = ""
+
+
+class ProbeBody(BaseModel):
+    host: str
+    port: int = 1099
+    ssh_port: int = 22
+
+
+KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$")
+
+
+def validate_node(body: NodeBody) -> dict:
+    key = body.key.strip()
+    if not KEY_RE.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail="名稱只能使用英數字、底線、連字號、點，需以英數字開頭，最長 32 字元",
+        )
+    host = body.host.strip()
+    if not HOST_RE.match(host):
+        raise HTTPException(
+            status_code=400,
+            detail="主機格式不正確，只填 IP 或域名，不要含 http:// 或路徑",
+        )
+    if not 1 <= body.port <= 65535:
+        raise HTTPException(status_code=400, detail="RMI 端口需在 1 ~ 65535 之間")
+    if not 1 <= body.ssh_port <= 65535:
+        raise HTTPException(status_code=400, detail="SSH 端口需在 1 ~ 65535 之間")
+    if not 1 <= body.max_threads <= 10000:
+        raise HTTPException(status_code=400, detail="執行緒上限需在 1 ~ 10000 之間")
+    return {
+        "key": key,
+        "host": host,
+        "port": body.port,
+        "ssh_port": body.ssh_port,
+        "region": (body.region.strip() or "—")[:16],
+        "max_threads": body.max_threads,
+        "enabled": body.enabled,
+        "note": body.note.strip()[:200],
+    }
+
+
 @app.post("/api/login")
 async def login(body: LoginBody, request: Request):
     if not hmac.compare_digest(body.token.strip(), WEB_TOKEN):
@@ -540,6 +592,7 @@ async def get_state(_=Depends(require_auth)):
             "key": key,
             "host": cfg.get("host", ""),
             "port": int(cfg.get("port", 1099)),
+            "ssh_port": int(cfg.get("ssh_port", 22)),
             "region": cfg.get("region", "—"),
             "max_threads": int(cfg.get("max_threads", 0)),
             "enabled": bool(cfg.get("enabled", True)),
@@ -586,6 +639,85 @@ async def toggle_node(key: str, body: ToggleBody, request: Request, _=Depends(re
     save_config(config)
     audit("TOGGLE", request.client.host if request.client else "-", f"{key}={body.enabled}")
     return {"ok": True, "key": key, "enabled": body.enabled}
+
+
+def _node_entry(data: dict) -> dict:
+    return {
+        "host": data["host"],
+        "port": data["port"],
+        "ssh_port": data["ssh_port"],
+        "region": data["region"],
+        "max_threads": data["max_threads"],
+        "enabled": data["enabled"],
+        "note": data["note"],
+    }
+
+
+@app.post("/api/nodes")
+async def create_node(body: NodeBody, request: Request, _=Depends(require_auth)):
+    data = validate_node(body)
+    config = load_config()
+    nodes = config.setdefault("nodes", {})
+    if data["key"] in nodes:
+        raise HTTPException(status_code=409, detail=f"節點名稱 {data['key']} 已存在")
+    nodes[data["key"]] = _node_entry(data)
+    save_config(config)
+    audit("NODE-ADD", request.client.host if request.client else "-",
+          f"{data['key']} {data['host']}:{data['port']} threads={data['max_threads']}")
+    asyncio.create_task(probe_node(data["key"], nodes[data["key"]]))
+    return {"ok": True, "key": data["key"], "nodes": len(nodes)}
+
+
+@app.put("/api/nodes/{key}")
+async def update_node(key: str, body: NodeBody, request: Request, _=Depends(require_auth)):
+    data = validate_node(body)
+    config = load_config()
+    nodes = config.get("nodes", {})
+    if key not in nodes:
+        raise HTTPException(status_code=404, detail="節點不存在")
+    new_key = data["key"]
+    if new_key != key and new_key in nodes:
+        raise HTTPException(status_code=409, detail=f"節點名稱 {new_key} 已存在")
+
+    if new_key == key:
+        nodes[key] = _node_entry(data)
+    else:
+        rebuilt = {}
+        for k, v in nodes.items():
+            rebuilt[new_key if k == key else k] = _node_entry(data) if k == key else v
+        config["nodes"] = rebuilt
+        STATE.pop(key, None)
+    save_config(config)
+    audit("NODE-EDIT", request.client.host if request.client else "-",
+          f"{key}->{new_key} {data['host']}:{data['port']} threads={data['max_threads']}")
+    asyncio.create_task(probe_node(new_key, config["nodes"][new_key]))
+    return {"ok": True, "key": new_key, "renamed": new_key != key}
+
+
+@app.delete("/api/nodes/{key}")
+async def delete_node(key: str, request: Request, _=Depends(require_auth)):
+    config = load_config()
+    nodes = config.get("nodes", {})
+    if key not in nodes:
+        raise HTTPException(status_code=404, detail="節點不存在")
+    removed = nodes.pop(key)
+    save_config(config)
+    STATE.pop(key, None)
+    audit("NODE-DEL", request.client.host if request.client else "-",
+          f"{key} {removed.get('host', '')}")
+    return {"ok": True, "key": key, "nodes": len(nodes)}
+
+
+@app.post("/api/probe")
+async def probe_target(body: ProbeBody, _=Depends(require_auth)):
+    host = body.host.strip()
+    if not HOST_RE.match(host):
+        raise HTTPException(status_code=400, detail="主機格式不正確")
+    if not 1 <= body.port <= 65535 or not 1 <= body.ssh_port <= 65535:
+        raise HTTPException(status_code=400, detail="端口需在 1 ~ 65535 之間")
+    rmi_ok, rmi_ms = await tcp_probe(host, body.port, timeout=4.0)
+    ssh_ok, _ms = await tcp_probe(host, body.ssh_port, timeout=4.0)
+    return {"rmi": rmi_ok, "rmi_ms": rmi_ms if rmi_ok else None, "ssh": ssh_ok}
 
 
 @app.get("/api/nodes/{key}/inspect")
