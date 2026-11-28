@@ -149,6 +149,22 @@ def load_proxy_pool():
     return px.load(PROXIES_FILE)
 
 
+def proxy_params(pool: list) -> dict:
+    """把代理清單轉成 JMeter 屬性（proxyHost/Port/User/Pass）。
+
+    為什麼只用第一個入口：JMeter 分散式模式下 JSR223 腳本無法序列化到遠端引擎，
+    所以不能靠腳本逐執行緒挑代理。輪換閘道型代理（例如 udealproxy）本身每次
+    新建連線就會換出口 IP，所有執行緒共用同一個入口即可達到多 IP 效果。
+    """
+    p = pool[0]
+    return {
+        "proxyHost": p.host,
+        "proxyPort": str(p.port),
+        "proxyUser": p.user,
+        "proxyPass": p.password,
+    }
+
+
 def audit(action: str, user: str, detail: str) -> None:
     line = f"{datetime.now().isoformat(timespec='seconds')} | {action:12s} | {user} | {detail}\n"
     with open(AUDIT_LOG, "a", encoding="utf-8") as f:
@@ -198,6 +214,8 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
         global_extra=global_extra,
     )
 
+    # 清掉上一場可能殘留的 JMeter 孤兒進程，否則 RMI 會被佔住導致整場失敗
+    await dist.kill_stale_jmeter()
     RUNNING.update(active=True, started=datetime.now(), label=key)
     audit(
         "OVERRIDE" if override else "START",
@@ -972,7 +990,7 @@ async def start_cmd(interaction: discord.Interaction, key: str, threads: int,
         duration, str(interaction.user), False,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
         plan="oneshot-proxy.jmx" if proxy else (target.get("plan") or "oneshot.jmx"),
-        global_extra={"proxylist": px.encode_for_jmeter(http_pool)} if proxy else None,
+        global_extra=proxy_params(http_pool) if proxy else None,
     )
 
 
@@ -995,6 +1013,8 @@ async def execute_stepped(channel, key: str, target: dict, stages: list[int],
     rows: list[dict] = []
     nodes_used: list[str] = []
 
+    # 清掉上一場可能殘留的 JMeter 孤兒進程，否則 RMI 會被佔住導致整場失敗
+    await dist.kill_stale_jmeter()
     RUNNING.update(active=True, proc=None, started=started, label=key, stop=False)
     audit("STEPPED", operator,
           f"{key} domain={target['domain']} stages={','.join(map(str, stages))} "
@@ -1348,7 +1368,7 @@ async def stepped_cmd(interaction: discord.Interaction, key: str, stages: str,
         str(interaction.user), url=raw, only=only,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
         plan="oneshot-proxy.jmx" if proxy else (target.get("plan") or "oneshot.jmx"),
-        global_extra={"proxylist": px.encode_for_jmeter(http_pool)} if proxy else None,
+        global_extra=proxy_params(http_pool) if proxy else None,
     )
 
 
@@ -1363,10 +1383,7 @@ async def abort(interaction: discord.Interaction):
     RUNNING["stop"] = True
     proc = RUNNING.get("proc")
     if proc is not None:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        dist.kill_tree(proc)
     RUNNING.update(active=False, proc=None)
     audit("ABORT", str(interaction.user), "手動中止")
     patch_status(state="aborted", error="手動中止", updated_by=str(interaction.user))

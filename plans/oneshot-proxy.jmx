@@ -1,7 +1,7 @@
 <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="One Shot via Proxy" enabled="true">
-      <stringProp name="TestPlan.comments">由 /start 或 /stepped 帶入參數。proxylist 為 base64 編碼的代理清單；前置處理器只在每個執行緒第一次執行時挑選代理，之後沿用，以保留連線重用。</stringProp>
+      <stringProp name="TestPlan.comments">由 /start 或 /stepped 帶入參數。代理以 -J/-G 的 proxyHost/Port/User/Pass 傳入；輪換閘道型代理每次連線自動換出口 IP，因此所有執行緒共用同一個入口即可。</stringProp>
       <boolProp name="TestPlan.functional_mode">false</boolProp>
       <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
       <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="使用者定義的變數" enabled="true">
@@ -41,42 +41,21 @@
           <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
           <stringProp name="HTTPSampler.connect_timeout">10000</stringProp>
           <stringProp name="HTTPSampler.response_timeout">30000</stringProp>
+          <stringProp name="HTTPSampler.proxyHost">${__P(proxyHost,)}</stringProp>
+          <stringProp name="HTTPSampler.proxyPort">${__P(proxyPort,)}</stringProp>
+          <stringProp name="HTTPSampler.proxyUser">${__P(proxyUser,)}</stringProp>
+          <stringProp name="HTTPSampler.proxyPass">${__P(proxyPass,)}</stringProp>
           <stringProp name="HTTPSampler.proxyHost">${px_host}</stringProp>
           <stringProp name="HTTPSampler.proxyPort">${px_port}</stringProp>
           <stringProp name="HTTPSampler.proxyUser">${px_user}</stringProp>
           <stringProp name="HTTPSampler.proxyPass">${px_pass}</stringProp>
         </HTTPSamplerProxy>
         <hashTree>
-          <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="Assign Proxy" enabled="true">
-            <stringProp name="scriptLanguage">groovy</stringProp>
-            <stringProp name="parameters"></stringProp>
-            <stringProp name="filename"></stringProp>
-            <stringProp name="cacheKey">true</stringProp>
-            <stringProp name="script">if (vars.get('px_host') == null) {
-    def raw = props.get('proxylist')
-    if (raw == null || raw.trim().isEmpty()) {
-        return
-    }
-    def text = new String(java.util.Base64.getDecoder().decode(raw.trim()), 'UTF-8')
-    def rows = text.split('\n').findAll { it.trim() }
-    if (rows.isEmpty()) {
-        return
-    }
-    int idx = ctx.getThreadNum() % rows.size()
-    def f = rows[idx].split('\u0001', -1)
-    vars.put('px_scheme', f[0])
-    vars.put('px_host', f[1])
-    vars.put('px_port', f[2])
-    vars.put('px_user', f.length &gt; 3 ? f[3] : '')
-    vars.put('px_pass', f.length &gt; 4 ? f[4] : '')
-}</stringProp>
-          </JSR223PreProcessor>
-          <hashTree/>
           <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Headers" enabled="true">
             <collectionProp name="HeaderManager.headers">
               <elementProp name="" elementType="Header">
                 <stringProp name="Header.name">User-Agent</stringProp>
-                <stringProp name="Header.value">JMeter-LoadTest/1.0</stringProp>
+                <stringProp name="Header.value">Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36</stringProp>
               </elementProp>
               <elementProp name="" elementType="Header">
                 <stringProp name="Header.name">Accept-Encoding</stringProp>

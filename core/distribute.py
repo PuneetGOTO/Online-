@@ -6,8 +6,45 @@ JMeter 分散式模式的重點：每個 remote engine 會各自跑一份計畫�
 """
 import asyncio
 import math
+import os
+import signal
 import time
 from pathlib import Path
+
+
+def kill_tree(proc) -> None:
+    """殺掉整個進程群組。
+
+    `bin/jmeter` 是一支 shell 包裝，真正跑測試的是它底下的 java 子進程。
+    只對包裝腳本呼叫 proc.kill() 會留下孤兒 java 進程：它會繼續佔用 RMI
+    與遠端引擎連線，導致之後每一場分散式壓測都失敗在
+    `rconfigure() ... NotSerializableException`。
+    """
+    if proc is None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+async def kill_stale_jmeter() -> int:
+    """清掉殘留的 JMeter 客戶端進程（`-n` 非 GUI 模式），回傳殺掉的數量。
+
+    只比對 `ApacheJMeter.jar -n`，不會誤殺節點上的 jmeter-server（`-s`）。
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pkill", "-9", "-f", "ApacheJMeter.jar -n",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return await proc.wait()
+    except FileNotFoundError:
+        return -1
 
 
 async def node_alive(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -144,13 +181,14 @@ async def run_distributed(cmd: list[str], jtl: Path, cwd: Path, on_progress,
             cwd=str(cwd),
             stdout=sink,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         if on_start is not None:
             on_start(proc)
 
         while proc.returncode is None:
             if deadline is not None and time.time() > deadline:
-                proc.kill()
+                kill_tree(proc)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=10)
                 except asyncio.TimeoutError:
