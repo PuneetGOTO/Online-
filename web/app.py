@@ -198,12 +198,15 @@ def save_creds(data: dict) -> None:
         pass
 
 
-def store_cred(key: str, user: str, password: str) -> None:
+def store_cred(key: str, user: str, password: str = "", private_key: str = "") -> None:
+    """存放節點憑證。password 或 private_key 至少給一個。"""
     data = load_creds()
-    data[key] = {
-        "user": user,
-        "password": _fernet().encrypt(password.encode()).decode(),
-    }
+    entry = {"user": user}
+    if password:
+        entry["password"] = _fernet().encrypt(password.encode()).decode()
+    if private_key:
+        entry["private_key"] = _fernet().encrypt(private_key.encode()).decode()
+    data[key] = entry
     save_creds(data)
 
 
@@ -225,10 +228,12 @@ def get_cred(key: str) -> Optional[dict]:
     if not item:
         return None
     try:
-        return {
-            "user": item.get("user", "root"),
-            "password": _fernet().decrypt(item["password"].encode()).decode(),
-        }
+        cred = {"user": item.get("user", "root"), "password": "", "private_key": ""}
+        if item.get("password"):
+            cred["password"] = _fernet().decrypt(item["password"].encode()).decode()
+        if item.get("private_key"):
+            cred["private_key"] = _fernet().decrypt(item["private_key"].encode()).decode()
+        return cred
     except Exception:
         return None
 
@@ -714,18 +719,28 @@ def _kill_remote(host: str, port: int, user: str, password: str) -> None:
 
 
 def _deploy_blocking(job: Job, emit, host: str, ssh_port: int, user: str,
-                     password: str, master_ip: str, name: str) -> bool:
-    """以密碼認證部署單一節點（阻塞，需在執行緒中呼叫）。"""
+                     password: str, master_ip: str, name: str,
+                     private_key: str = "") -> bool:
+    """以金鑰或密碼認證部署單一節點（阻塞，需在執行緒中呼叫）。"""
+    import io
+
     import paramiko
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        emit(f"$ ssh {user}@{host}:{ssh_port}（密碼認證）", "cmd")
+        auth_kw = {}
+        if private_key:
+            emit(f"$ ssh {user}@{host}:{ssh_port}（金鑰認證）", "cmd")
+            auth_kw["pkey"] = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
+        else:
+            emit(f"$ ssh {user}@{host}:{ssh_port}（密碼認證）", "cmd")
+            auth_kw["password"] = password
         client.connect(
-            host, port=ssh_port, username=user, password=password,
+            host, port=ssh_port, username=user,
             timeout=20, banner_timeout=20, auth_timeout=20,
             allow_agent=False, look_for_keys=False,
+            **auth_kw,
         )
         emit("SSH 認證成功", "ok")
 
@@ -813,7 +828,8 @@ async def deploy_one(job: Job, key: str, cfg: dict, master_ip: str) -> bool:
 
         ok = await asyncio.to_thread(
             _deploy_blocking, job, emit, host, int(cfg.get("ssh_port", 22)),
-            cred["user"], cred["password"], master_ip, key,
+            cred["user"], cred.get("password", ""), master_ip, key,
+            cred.get("private_key", ""),
         )
         if job.cancel_flag:
             job.set_node(key, "已中止")
@@ -1056,6 +1072,7 @@ class EcsServerIn(BaseModel):
     host: str
     ssh_user: str = "root"
     ssh_password: str = ""
+    ssh_private_key: str = ""
     ssh_port: int = 22
     expires_at: Optional[str] = None
     max_threads: int = 600
@@ -1596,8 +1613,8 @@ async def ecs_hook(body: EcsHookBody, request: Request):
             "expires_at": srv.expires_at,
             "added_at": datetime.now().isoformat(timespec="seconds"),
         }
-        if srv.ssh_password:
-            store_cred(key, srv.ssh_user or "root", srv.ssh_password)
+        if srv.ssh_password or srv.ssh_private_key:
+            store_cred(key, srv.ssh_user or "root", srv.ssh_password, srv.ssh_private_key)
         accepted.append(key)
 
     save_config(config)
@@ -1615,8 +1632,85 @@ async def ecs_hook(body: EcsHookBody, request: Request):
     }
 
 
+async def _wait_port(host: str, port: int, timeout: float = 300) -> bool:
+    """等遠端埠可連線。雲端剛開機時 sshd 還沒起來，太早部署會直接逾時。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            await asyncio.sleep(5)
+    return False
+
+
+def _ssh_auth_ready(host: str, port: int, user: str, password: str = "",
+                    timeout: float = 300, private_key: str = "") -> bool:
+    """等 SSH 真的能登入（不只埠開著）。
+
+    雲端剛開機時 sshd 已經在跑，但 cloud-init 還沒把 root 密碼設好，
+    這時連上去會認證失敗。必須等到「能認證成功」才部署。
+    """
+    import io
+
+    import paramiko
+
+    auth_kw = {}
+    if private_key:
+        auth_kw["pkey"] = paramiko.Ed25519Key.from_private_key(io.StringIO(private_key))
+    else:
+        auth_kw["password"] = password
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(
+                host, port=port, username=user,
+                timeout=8, banner_timeout=10, auth_timeout=10,
+                allow_agent=False, look_for_keys=False,
+                **auth_kw,
+            )
+            return True
+        except Exception:
+            time.sleep(5)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return False
+
+
 async def _deploy_hook_nodes(keys: list[str]) -> None:
     """等目前部署任務結束後，把新機器部署成節點。"""
+    # 先等各節點的 SSH 認證可用，避免在 cloud-init 還沒設好密碼時就部署
+    nodes = load_config().get("nodes", {})
+    waits = []
+    for k in keys:
+        cfg = nodes.get(k)
+        if not cfg:
+            continue
+        cred = get_cred(k)
+        if cred:
+            waits.append(asyncio.to_thread(
+                _ssh_auth_ready, cfg["host"], int(cfg.get("ssh_port", 22)),
+                cred["user"], cred.get("password", ""), 300,
+                cred.get("private_key", ""),
+            ))
+        else:
+            waits.append(_wait_port(cfg["host"], int(cfg.get("ssh_port", 22))))
+    if waits:
+        await asyncio.gather(*waits, return_exceptions=True)
+
     waited = 0.0
     while CURRENT["job"] is not None and waited < 600:
         await asyncio.sleep(3)
