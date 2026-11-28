@@ -866,6 +866,10 @@ curl -fsSL "http://<平台位址>:8080/api/hooks/ecs/node.sh?token=<HOOK_TOKEN>"
 | 1099 | 平台 IP | JMeter RMI 控制 |
 | 4000-4010 | 平台 IP | RMI 回傳通道 |
 
+若開服機器人使用本專案提供的對接模組，這些規則會在每次開服前**自動補上**
+（`services/security_group.py`，以 `/32` 限定只允許平台 IP，已存在則跳過）。
+也可用 `LOADTEST_SG_PORTS` 自訂埠範圍、`LOADTEST_SG_ENSURE=false` 停用。
+
 ## 指令一覽
 
 | 指令 | 權限 | 說明 |
