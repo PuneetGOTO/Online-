@@ -1,7 +1,18 @@
 const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+const ICON_COPY = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 10.5V3.8A1.3 1.3 0 0 1 4.3 2.5h6.7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
 const ICON_EDIT = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M11.2 2.1l2.7 2.7-8.3 8.3-3.5.8.8-3.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
 const ICON_TRASH = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M3 4.6h10M6.4 4.6V3.1h3.2v1.5M4.6 4.6l.6 8.3h5.6l.6-8.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+
+const VIEW_TITLES = {
+  overview: '總覽儀表板',
+  nodes: '伺服器節點',
+  targets: '壓測目標',
+  reports: '壓測報告',
+  bot: 'Discord 機器人',
+  deploy: '部署終端',
+};
 
 let latestState = null;
 let activeJobId = null;
@@ -10,7 +21,49 @@ let jobTimer = null;
 let stateTimer = null;
 let renderedLines = 0;
 
-/* ---------------------------------------------------------------- 工具 */
+/* ---------------------------------------------------------------- 主題與版面 */
+
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('lt_theme', next);
+  const label = $('#theme-label');
+  if (label) label.textContent = next === 'dark' ? '淺色模式' : '深色模式';
+}
+
+applyTheme(localStorage.getItem('lt_theme') || 'dark');
+
+$('#btn-theme').addEventListener('click', () => {
+  const cur = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
+});
+
+function setView(view) {
+  const targetView = VIEW_TITLES[view] ? view : 'overview';
+  $('#workspace').dataset.view = targetView;
+  $('#page-title').textContent = VIEW_TITLES[targetView];
+  $$('.nav-item[data-nav]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.nav === targetView);
+  });
+  sessionStorage.setItem('lt_view', targetView);
+  $('#app').classList.remove('sidebar-open');
+}
+
+$$('.nav-item[data-nav]').forEach((btn) => {
+  btn.addEventListener('click', () => setView(btn.dataset.nav));
+});
+
+$('#btn-menu').addEventListener('click', () => {
+  $('#app').classList.toggle('sidebar-open');
+});
+
+$('#sidebar-overlay').addEventListener('click', () => {
+  $('#app').classList.remove('sidebar-open');
+});
+
+setView(sessionStorage.getItem('lt_view') || 'overview');
+
+/* ---------------------------------------------------------------- 工具與通知 */
 
 function esc(value) {
   return String(value == null ? '' : value)
@@ -18,6 +71,34 @@ function esc(value) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function toast(message, kind = 'info') {
+  const root = $('#toast-root');
+  if (!root) return;
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = message;
+  root.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('leaving');
+    setTimeout(() => el.remove(), 220);
+  }, 3000);
+}
+
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const input = document.createElement('textarea');
+  input.value = text;
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  document.body.appendChild(input);
+  input.select();
+  document.execCommand('copy');
+  input.remove();
 }
 
 async function api(path, options = {}) {
@@ -55,18 +136,29 @@ function stopTimers() {
 
 /* ---------------------------------------------------------------- 登入 */
 
+$('#btn-toggle-token').addEventListener('click', () => {
+  const input = $('#token');
+  input.type = input.type === 'password' ? 'text' : 'password';
+  input.focus();
+});
+
 $('#login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('#login-error').textContent = '';
+  const btn = $('#btn-login-submit');
+  btn.disabled = true;
   try {
     await api('/api/login', {
       method: 'POST',
       body: JSON.stringify({ token: $('#token').value.trim() }),
     });
     $('#token').value = '';
+    $('#token').type = 'password';
     await boot();
   } catch (err) {
     $('#login-error').textContent = err.message === 'unauth' ? '權杖不正確' : err.message;
+  } finally {
+    btn.disabled = false;
   }
 });
 
@@ -85,8 +177,10 @@ async function refreshState() {
     if (state.job && state.job.id !== activeJobId) {
       attachJob(state.job.id);
     }
+    return true;
   } catch (err) {
     if (err.message !== 'unauth') console.warn('[state]', err.message);
+    return false;
   }
 }
 
@@ -95,12 +189,22 @@ function renderState(state) {
 
   $('#server-line').textContent =
     `${server.hostname} · ${server.master_ip} · JMeter ${server.jmeter}`;
+  $('#sidebar-server-host').textContent = server.hostname || server.master_ip;
+  $('#sidebar-server-meta').textContent = `${server.master_ip} · JM ${server.jmeter}`;
+
+  const healthCls = summary.online === summary.total && summary.total > 0
+    ? 'ok'
+    : summary.online === 0 ? 'err' : 'warn';
 
   const onlineChip = $('#chip-online');
   onlineChip.textContent = `${summary.online} / ${summary.total} 在線`;
-  onlineChip.className = 'chip ' + (summary.online === summary.total && summary.total > 0 ? 'ok' : summary.online === 0 ? 'err' : 'warn');
+  onlineChip.className = 'chip ' + healthCls;
 
-  $('#chip-capacity').textContent = `容量 ${summary.capacity}`;
+  const navNodes = $('#nav-badge-nodes');
+  navNodes.textContent = `${summary.online}/${summary.total}`;
+  navNodes.className = 'nav-badge ' + (summary.total ? healthCls : '');
+
+  $('#chip-capacity').textContent = `容量 ${summary.capacity.toLocaleString()}`;
 
   $('#stat-online').textContent = `${summary.online} / ${summary.total}`;
   $('#stat-online-hint').textContent = summary.offline.length
@@ -126,27 +230,66 @@ function renderState(state) {
   if (job) renderJobChip(job);
 }
 
-function sparkline(history) {
-  const values = history.filter((v) => typeof v === 'number');
+function sparkline(history, key) {
+  const values = (history || []).filter((v) => typeof v === 'number');
   if (values.length < 2) return '<div class="spark-empty">延遲資料累積中…</div>';
+
   const width = 300;
   const height = 34;
   const max = Math.max(...values, 1);
   const min = Math.min(...values, 0);
   const span = Math.max(max - min, 1);
   const step = width / Math.max(history.length - 1, 1);
-  let path = '';
-  let drawing = false;
+
+  const lastVal = values[values.length - 1];
+  const color = lastVal < 80 ? 'var(--ok)' : lastVal < 200 ? 'var(--warn)' : 'var(--err)';
+  const safeId = String(key || 'node').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+  let linePath = '';
+  let areaPath = '';
+  let segStart = null;
+  let lastPt = null;
+
   history.forEach((value, index) => {
-    if (typeof value !== 'number') { drawing = false; return; }
+    if (typeof value !== 'number') {
+      if (segStart !== null && lastPt !== null) {
+        areaPath += ` L${lastPt.x.toFixed(1)} ${height} L${segStart.toFixed(1)} ${height} Z`;
+        segStart = null;
+      }
+      return;
+    }
     const x = index * step;
-    const y = height - ((value - min) / span) * (height - 6) - 3;
-    path += `${drawing ? ' L' : ' M'}${x.toFixed(1)} ${y.toFixed(1)}`;
-    drawing = true;
+    const y = height - ((value - min) / span) * (height - 7) - 3.5;
+    if (segStart === null) {
+      segStart = x;
+      linePath += ` M${x.toFixed(1)} ${y.toFixed(1)}`;
+      areaPath += ` M${x.toFixed(1)} ${y.toFixed(1)}`;
+    } else {
+      linePath += ` L${x.toFixed(1)} ${y.toFixed(1)}`;
+      areaPath += ` L${x.toFixed(1)} ${y.toFixed(1)}`;
+    }
+    lastPt = { x, y };
   });
+
+  if (segStart !== null && lastPt !== null) {
+    areaPath += ` L${lastPt.x.toFixed(1)} ${height} L${segStart.toFixed(1)} ${height} Z`;
+  }
+
+  const dotHtml = lastPt
+    ? `<circle cx="${lastPt.x.toFixed(1)}" cy="${lastPt.y.toFixed(1)}" r="2.8" fill="${color}"></circle>`
+    : '';
+
   return `<svg class="spark" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
-    <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="1.6"
-          stroke-linejoin="round" stroke-linecap="round" opacity="0.85"></path>
+    <defs>
+      <linearGradient id="sp-${safeId}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${color}" stop-opacity="0.28"></stop>
+        <stop offset="100%" stop-color="${color}" stop-opacity="0.0"></stop>
+      </linearGradient>
+    </defs>
+    <path d="${areaPath}" fill="url(#sp-${safeId})"></path>
+    <path d="${linePath}" fill="none" stroke="${color}" stroke-width="1.75"
+          stroke-linejoin="round" stroke-linecap="round"></path>
+    ${dotHtml}
   </svg>`;
 }
 
@@ -177,13 +320,23 @@ function renderNodes(nodes, job) {
       ? `${node.latency_ms < 1 ? '<1' : Math.round(node.latency_ms)} ms`
       : '離線';
 
+    const latCls = !node.online
+      ? 'bad'
+      : (node.latency_ms != null && node.latency_ms >= 200)
+        ? 'bad'
+        : (node.latency_ms != null && node.latency_ms >= 80)
+          ? 'warn'
+          : 'ok';
+
     const sshBadge = node.ssh_ok
       ? '<span class="badge ok">SSH 可用</span>'
       : '<span class="badge err">SSH 不通</span>';
 
     const deployStatus = busy && job.nodes && job.nodes[node.key]
-      ? `<span class="badge">${esc(job.nodes[node.key])}</span>`
+      ? `<span class="badge warn">${esc(job.nodes[node.key])}</span>`
       : sshBadge;
+
+    const addr = `${node.host}:${node.port}`;
 
     return `
       <article class="${classes.join(' ')}">
@@ -197,8 +350,9 @@ function renderNodes(nodes, job) {
           </label>
         </div>
         <div class="node-host">
-          <span class="addr mono">${esc(node.host)}:${node.port}</span>
+          <span class="addr mono">${esc(addr)}</span>
           <span class="host-actions">
+            <button class="icon-mini" data-act="copy" data-addr="${esc(addr)}" title="複製位址">${ICON_COPY}</button>
             <button class="icon-mini" data-act="edit" data-key="${esc(node.key)}" title="編輯">${ICON_EDIT}</button>
             <button class="icon-mini danger" data-act="delete" data-key="${esc(node.key)}" title="刪除">${ICON_TRASH}</button>
           </span>
@@ -206,7 +360,7 @@ function renderNodes(nodes, job) {
         <div class="node-metrics">
           <div class="metric">
             <span class="k">延遲</span>
-            <span class="v ${node.online ? '' : 'bad'}">${latency}</span>
+            <span class="v ${latCls}">${latency}</span>
           </div>
           <div class="metric">
             <span class="k">執行緒上限</span>
@@ -214,12 +368,12 @@ function renderNodes(nodes, job) {
           </div>
           <div class="metric">
             <span class="k">檢查</span>
-            <span class="v" style="font-weight:500;font-size:12.5px;color:var(--muted)">
+            <span class="v muted-val">
               ${node.checked_ago == null ? '—' : Math.round(node.checked_ago) + ' 秒前'}
             </span>
           </div>
         </div>
-        <div class="spark-wrap">${sparkline(node.history)}</div>
+        <div class="spark-wrap">${sparkline(node.history, node.key)}</div>
         <div class="node-foot">
           ${deployStatus}
           <span class="spacer"></span>
@@ -235,8 +389,15 @@ function renderNodes(nodes, job) {
 $('#node-grid').addEventListener('click', async (event) => {
   const button = event.target.closest('button[data-act]');
   if (!button) return;
-  const { act, key } = button.dataset;
-  if (act === 'deploy') {
+  const { act, key, addr } = button.dataset;
+  if (act === 'copy') {
+    try {
+      await copyText(addr);
+      toast(`已複製 ${addr}`, 'ok');
+    } catch (_) {
+      toast('無法複製到剪貼簿', 'err');
+    }
+  } else if (act === 'deploy') {
     await startDeploy({ scope: 'node', key });
   } else if (act === 'inspect') {
     await inspectNode(key);
@@ -258,9 +419,10 @@ $('#node-grid').addEventListener('change', async (event) => {
       method: 'POST',
       body: JSON.stringify({ enabled: input.checked }),
     });
+    toast(`${key} 已${input.checked ? '啟用' : '停用'}`, 'ok');
     await refreshState();
   } catch (err) {
-    alert(`切換失敗：${err.message}`);
+    toast(`切換失敗：${err.message}`, 'err');
     input.checked = !input.checked;
   }
 });
@@ -289,6 +451,8 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     $('#modal').classList.add('hidden');
     closeNodeModal();
+    closeTargetModal();
+    $('#app').classList.remove('sidebar-open');
   }
 });
 
@@ -411,6 +575,7 @@ async function saveNode(deployAfter) {
         })
       : await api('/api/nodes', { method: 'POST', body: JSON.stringify(payload) });
     closeNodeModal();
+    toast(`已儲存節點 ${saved.key}`, 'ok');
     await refreshState();
     if (deployAfter) await startDeploy({ scope: 'node', key: saved.key });
   } catch (err) {
@@ -472,9 +637,10 @@ async function deleteNode(key) {
   if (!confirm(`刪除節點 ${key}？\n\n只會從 nodes.json 移除，不會動到那台伺服器上的 jmeter-server。`)) return;
   try {
     await api(`/api/nodes/${encodeURIComponent(key)}`, { method: 'DELETE' });
+    toast(`已刪除節點 ${key}`, 'ok');
     await refreshState();
   } catch (err) {
-    alert(`刪除失敗：${err.message}`);
+    toast(`刪除失敗：${err.message}`, 'err');
   }
 }
 
@@ -496,9 +662,17 @@ async function startDeploy(body) {
     clearLog();
     appendLine({ t: nowText(), level: 'info', text: `任務 ${job.job_id}：${job.title}` });
     attachJob(job.job_id);
+    const curView = $('#workspace').dataset.view;
+    if (curView !== 'overview' && curView !== 'deploy') {
+      setView('deploy');
+    } else if (curView === 'overview') {
+      const dp = $('#deploy-panel');
+      if (dp) dp.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+    toast(`已啟動部署任務：${job.title}`, 'info');
     await refreshState();
   } catch (err) {
-    alert(`無法開始部署：${err.message}`);
+    toast(`無法開始部署：${err.message}`, 'err');
   }
 }
 
@@ -525,15 +699,7 @@ async function pollJob() {
 }
 
 function renderJob(job) {
-  const chip = $('#job-chip');
-  const map = {
-    running: 'run',
-    success: 'ok',
-    failed: 'err',
-    cancelled: 'warn',
-  };
-  chip.textContent = jobLabel(job);
-  chip.className = 'chip ' + (map[job.status] || '');
+  renderJobChip(job);
 
   $('#btn-cancel').classList.toggle('hidden', job.status !== 'running');
   $('#btn-clear-log').disabled = job.status === 'running';
@@ -563,14 +729,24 @@ function jobLabel(job) {
 function renderJobChip(job) {
   const chip = $('#job-chip');
   const map = { running: 'run', success: 'ok', failed: 'err', cancelled: 'warn' };
-  chip.textContent = jobLabel(job);
-  chip.className = 'chip ' + (map[job.status] || '');
+  const cls = map[job.status] || '';
+  const text = jobLabel(job);
+  chip.textContent = text;
+  chip.className = 'chip ' + cls;
+
+  const navDeploy = $('#nav-badge-deploy');
+  if (navDeploy) {
+    const shortNames = { running: '執行中', success: '完成', failed: '失敗', cancelled: '中止' };
+    navDeploy.textContent = shortNames[job.status] || '閒置';
+    navDeploy.className = 'nav-badge ' + cls;
+  }
 }
 
 $('#btn-cancel').addEventListener('click', async () => {
   if (!activeJobId) return;
   if (!confirm('確定中止目前的部署任務？')) return;
   await api(`/api/jobs/${activeJobId}/cancel`, { method: 'POST' });
+  toast('已送出中止指令', 'warn');
 });
 
 $('#btn-clear-log').addEventListener('click', clearLog);
@@ -725,6 +901,12 @@ function renderBot(bot) {
   chip.textContent = entry[0];
   chip.className = 'chip ' + entry[1];
 
+  const navBot = $('#nav-badge-bot');
+  if (navBot) {
+    navBot.className = 'nav-dot' + (entry[1] ? ' ' + entry[1] : '');
+    navBot.title = entry[0];
+  }
+
   $('#btn-bot-start').disabled = !bot.configured || bot.service === 'active' || botFormDirty;
   $('#btn-bot-stop').disabled = bot.service !== 'active';
   $('#btn-bot-restart').disabled = !bot.configured || botFormDirty;
@@ -830,7 +1012,7 @@ function renderLoadtest(lt) {
     if (ltCache.domain) meta.push(`目標 <b>${esc(ltCache.domain)}</b>`);
     if (ltCache.updated_at) meta.push(`更新於 ${esc(ltCache.updated_at.replace('T', ' '))}`);
   }
-  $('#lt-meta').innerHTML = meta.length ? meta.join(' · ') : '<span>—</span>';
+  $('#lt-meta').innerHTML = meta.length ? meta.join(' · ') : '<span>閒置待命，隨時可從 Discord 發起測試</span>';
 
   if (state === 'running') {
     if (ltCache.mode === 'stepped') {
@@ -866,7 +1048,6 @@ function renderLoadtest(lt) {
   }
 }
 
-// 每秒在前端推算秒數，不必等 5 秒輪詢
 setInterval(() => {
   if (!ltCache || ltCache.state !== 'running' || !ltCache.started_ts) return;
   if (ltCache.mode === 'stepped') return;
@@ -889,6 +1070,10 @@ function renderTargets(targets) {
   latestTargets = targets || [];
   const list = $('#targets-list');
   const count = $('#target-count');
+  const navTargets = $('#nav-badge-targets');
+
+  if (navTargets) navTargets.textContent = String(latestTargets.length);
+
   if (!latestTargets.length) {
     list.innerHTML = '<div class="results-empty">尚無目標，請先新增要壓測的網站</div>';
     count.textContent = '0 個';
@@ -999,9 +1184,10 @@ $('#targets-list').addEventListener('click', async (event) => {
     if (!confirm(`刪除目標 ${key}？之後 Discord 將無法選用它。`)) return;
     try {
       await api(`/api/targets/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      toast(`已刪除目標 ${key}`, 'ok');
       await refreshState();
     } catch (err) {
-      alert(err.message);
+      toast(err.message, 'err');
     }
   }
 });
@@ -1026,9 +1212,10 @@ $('#targets-list').addEventListener('change', async (event) => {
         enabled: input.checked,
       }),
     });
+    toast(`${key} 已${input.checked ? '啟用' : '停用'}`, 'ok');
     await refreshState();
   } catch (err) {
-    alert(err.message);
+    toast(err.message, 'err');
     input.checked = !input.checked;
   }
 });
@@ -1104,6 +1291,7 @@ targetForm.addEventListener('submit', async (event) => {
       await api('/api/targets', { method: 'POST', body: JSON.stringify(payload) });
     }
     closeTargetModal();
+    toast('已儲存壓測目標', 'ok');
     await refreshState();
   } catch (err) {
     setTargetStatus(err.message, 'err');
@@ -1127,23 +1315,34 @@ async function loadResults() {
 
 function renderResults(items) {
   const box = $('#results-list');
-  $('#results-count').textContent = items.length ? `${items.length} 份` : '—';
+  const countText = items.length ? `${items.length} 份` : '—';
+  $('#results-count').textContent = countText;
+  const navReports = $('#nav-badge-reports');
+  if (navReports) navReports.textContent = String(items.length);
+
   if (!items.length) {
     box.innerHTML = '<div class="results-empty">尚無測試結果</div>';
     return;
   }
   box.innerHTML = items.map((item) => {
     const stem = encodeURIComponent(item.stem);
-    const verdict = item.ok === true ? ' · 達標' : item.ok === false ? ' · 未達標' : '';
+    const verdictBadge = item.ok === true
+      ? '<span class="badge ok">達標</span>'
+      : item.ok === false
+        ? '<span class="badge err">未達標</span>'
+        : '';
     const threads = item.threads ? `${item.threads} 併發` : '—';
     return `
       <div class="result-row">
         <div class="result-main">
-          <div class="result-title">${esc(item.domain || item.stem)}</div>
-          <div class="result-meta">${esc(item.mtime)} · ${threads} · ${item.size_kb} KB${verdict}</div>
+          <div class="result-title-line">
+            <span class="result-title">${esc(item.domain || item.stem)}</span>
+            ${verdictBadge}
+          </div>
+          <div class="result-meta">${esc(item.mtime)} · ${threads} · ${item.size_kb} KB</div>
         </div>
         <div class="result-actions">
-          <a class="btn small" href="/api/results/${stem}/report?format=html">報告</a>
+          <a class="btn small" href="/api/results/${stem}/report?format=html" target="_blank" rel="noopener">報告</a>
           <a class="btn small ghost" href="/api/results/${stem}/report?format=md">Markdown</a>
           <a class="btn small ghost" href="/api/results/${stem}/raw?kind=jtl">原始資料</a>
         </div>
@@ -1153,7 +1352,15 @@ function renderResults(items) {
 
 /* ---------------------------------------------------------------- 啟動 */
 
-$('#btn-refresh').addEventListener('click', refreshState);
+$('#btn-refresh').addEventListener('click', async () => {
+  const btn = $('#btn-refresh');
+  btn.classList.add('is-spinning');
+  btn.disabled = true;
+  const ok = await refreshState();
+  btn.classList.remove('is-spinning');
+  btn.disabled = false;
+  if (ok) toast('狀態已更新', 'ok');
+});
 
 async function boot() {
   try {
