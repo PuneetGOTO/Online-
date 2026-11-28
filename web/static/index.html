@@ -93,6 +93,20 @@
       </div>
     </section>
 
+    <!-- 壓測目標 -->
+    <section class="panel targets-panel">
+      <div class="panel-head">
+        <h2>壓測目標</h2>
+        <span class="chip" id="target-count">—</span>
+        <span class="spacer"></span>
+        <span class="results-hint">Discord 只能選用這裡啟用的目標</span>
+        <button class="btn primary small" id="btn-add-target">新增目標</button>
+      </div>
+      <div class="targets-list" id="targets-list">
+        <div class="results-empty">尚無目標，請先新增要壓測的網站</div>
+      </div>
+    </section>
+
     <!-- 動作列 -->
     <section class="actionbar">
       <div class="actionbar-left">
@@ -251,6 +265,56 @@
       <button type="button" class="btn" id="btn-node-cancel">取消</button>
       <button type="submit" class="btn" id="btn-node-save">僅儲存</button>
       <button type="button" class="btn primary" id="btn-node-save-deploy" disabled>開始部署節點</button>
+    </div>
+  </form>
+</div>
+
+<!-- 新增／編輯壓測目標 -->
+<div id="target-modal" class="modal hidden">
+  <form class="modal-card form-card" id="target-form" autocomplete="off">
+    <div class="modal-head">
+      <h3 id="target-modal-title">新增目標</h3>
+      <button type="button" class="icon-btn" id="target-modal-close">×</button>
+    </div>
+    <div class="form-body">
+      <label class="field span2">
+        <span>要壓測的完整網址</span>
+        <input name="url" required placeholder="https://example.com/login/index.php">
+      </label>
+      <label class="field">
+        <span>名稱（選填）</span>
+        <input name="key" maxlength="32" placeholder="留空自動由域名產生">
+      </label>
+      <label class="field">
+        <span>客戶名稱</span>
+        <input name="client" maxlength="60" placeholder="Acme Ltd">
+      </label>
+      <label class="field">
+        <span>壓測計畫</span>
+        <select name="plan" id="target-plan"></select>
+      </label>
+      <label class="field">
+        <span>併發上限</span>
+        <input name="max_threads" type="number" min="1" max="10000" value="600">
+      </label>
+      <label class="field">
+        <span>時長上限（秒）</span>
+        <input name="max_duration" type="number" min="5" max="1800" value="600">
+      </label>
+      <label class="field">
+        <span>授權天數</span>
+        <input name="authorized_days" type="number" min="1" max="365" value="30">
+      </label>
+      <label class="check span2">
+        <input type="checkbox" name="enabled" checked>
+        <span>啟用（停用後 Discord 無法選用此目標）</span>
+      </label>
+      <div class="form-status span2" id="target-form-status"></div>
+    </div>
+    <div class="form-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="btn-target-cancel">取消</button>
+      <button type="submit" class="btn primary" id="btn-target-save">儲存</button>
     </div>
   </form>
 </div>

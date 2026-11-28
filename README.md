@@ -64,7 +64,7 @@ flowchart LR
 **授權模型**
 
 - 三層權限：`OWNER` / 授權管理員（網頁設定）/ 其他人（完全拒絕）
-- 一句話壓測：`/start 網址 埠 併發 https-get`，僅 OWNER 與授權管理員可用
+- 目標必須先在網頁控制台定義，`/start`、`/stepped` 只能從已定義且啟用的目標中選，指令端無法臨時輸入網址
 - 階梯壓測：`/stepped 網址 50,100,200,400`，逐級加壓找出容量拐點並產出曲線報告
 - 走完整流程的 `/loadtest` 仍需 OWNER 在 Discord 按下核准按鈕
 - `override` 僅 OWNER 可用，且永遠受全域硬上限約束
@@ -536,42 +536,61 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 
 ## 使用流程
 
+### 先在網頁控制台定義目標（必做）
+
+**壓測目標只能來自網頁控制台**，Discord 端不再接受臨時輸入的網址。控制台首頁的
+「壓測目標」面板可新增、編輯、啟停與刪除目標：
+
+| 欄位 | 說明 |
+|---|---|
+| 要壓測的完整網址 | 例 `https://example.com/login/index.php`，會自動拆出協定、端口、路徑 |
+| 名稱 | 留空會由域名自動產生（`example-com`） |
+| 客戶名稱 | 報告與 Discord 回覆會顯示 |
+| 壓測計畫 | `plans/` 下的 `.jmx`，下拉選單列出可用檔案 |
+| 併發上限 / 時長上限 | 該目標允許的最大值，Discord 端會以此為硬上限 |
+| 授權天數 | 到期後該目標自動不可壓測 |
+| 啟用 | 停用後 Discord 無法選用 |
+
+目標一旦建立並啟用，Discord 的 `/start`、`/stepped`、`/loadtest` 就能選到它。
+**沒在控制台定義過的網站，指令端打不到。**
+
 ### 一句話壓測（最常用）
 
 ```
-/start https://example.com/login/index.php 443 300 https-get
+/start moodle-aris-edu-org 300
 ```
 
 | 位置 | 意義 | 例 |
 |---|---|---|
-| 1 | 完整網址 | `https://example.com/login/index.php` |
-| 2 | 連接埠 | `443` |
-| 3 | 併發執行緒 | `300` |
-| 4 | 協定-方法 | `https-get` / `https-post` / `http-get` |
-| 5 | 持續秒數（選填） | `120`，預設 60 |
+| 1 | 目標名稱（自動完成選單，只能選已定義且啟用的） | `moodle-aris-edu-org` |
+| 2 | 併發執行緒 | `300` |
+| 3 | 持續秒數（選填） | `120`，預設 60 |
+| 4 | 只用指定節點（選填） | `nodes:Huawei1` |
+| 5 | 走代理池（選填） | `proxy:true` |
 
-一條指令就完成：解析網址 → 建立目標 → 核准 → 分配節點 → 開始壓測。
-不用先 `/target add`、也不用按核准按鈕。
+網址、端口、協定、方法都取自控制台的目標定義，指令端無法覆寫。
 
 **權限**：只有 `OWNER` 與「網頁控制台授權的管理員」能用，其他人一律拒絕並記錄
 `DENY-START`。管理員名單在控制台的 Discord 面板填寫，改完立即生效，不必重啟 Bot。
 
-**限制**：併發與時長仍受 `config/targets.json` 的 `global_max_threads` /
-`global_max_duration` 約束；同一時間只能有一場壓測在跑。
+**限制**：併發與時長受該目標的 `max_threads` / `max_duration` 約束，同時也受
+`config/targets.json` 的 `global_max_threads` / `global_max_duration` 限制；
+同一時間只能有一場壓測在跑。
 
 ### 階梯壓測（找容量拐點）
 
 ```
-/stepped https://example.com/login/index.php 50,100,200,400
+/stepped moodle-aris-edu-org 50,100,200,400
 ```
 
 | 位置 | 意義 | 例 |
 |---|---|---|
-| 1 | 完整網址 | `https://example.com/login/index.php` |
+| 1 | 目標名稱（只能選控制台已定義且啟用的） | `moodle-aris-edu-org` |
 | 2 | 各級併發，逗號分隔且**嚴格遞增** | `50,100,200,400` |
 | 3 | 每級持續秒數（選填） | 預設 `60` |
 | 4 | 級間間隔秒數（選填） | 預設 `60` |
-| 5 | 協定-方法（選填） | `https-get`，預設 `https-get` |
+| 5 | 只用指定節點（選填） | `nodes:Huawei1` |
+| 6 | 走代理池（選填） | `proxy:true` |
 
 單場高併發壓測只會得到一個「整體錯誤率」，看不出容量在哪裡飽和。階梯壓測
 逐級加壓，每一級都是一次完整的分散式壓測，跑完會產出：
@@ -597,8 +616,8 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 `/start` 與 `/stepped` 都支援 `nodes` 參數，只讓指定節點參與，其餘節點不產生流量：
 
 ```
-/start https://example.com/ 443 300 https-get nodes:HK-Huawei
-/stepped https://example.com/ 50,100,200 nodes:hk-1,hk-2
+/start example-com 300 nodes:Huawei1
+/stepped example-com 50,100,200 nodes:Huawei1
 ```
 
 留空或填 `all` 表示全部啟用中的節點。節點名稱要與 `config/nodes.json` 的 key 一致。
@@ -624,8 +643,8 @@ socks5://user:pass@203.0.113.12:1080
 **② 發壓時加上 `proxy`**：
 
 ```
-/start https://example.com/ 443 600 https-get proxy:true
-/stepped https://example.com/ 50,100,200 proxy:true
+/start example-com 600 proxy:true
+/stepped example-com 50,100,200 proxy:true
 ```
 
 **運作方式**：
@@ -749,8 +768,8 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 
 | 指令 | 權限 | 說明 |
 |---|---|---|
-| `/start url port threads mode` | **OWNER** / 授權管理員 | 一句話壓測，自動建立目標並執行；可加 `nodes:` 指定節點、`proxy:true` 走代理池 |
-| `/stepped url stages` | **OWNER** / 授權管理員 | 階梯壓測：逐級加壓找出容量拐點，例 `50,100,200,400`；同樣支援 `nodes:` 與 `proxy:true` |
+| `/start key threads` | **OWNER** / 授權管理員 | 對控制台已定義的目標發起壓測；可加 `nodes:` 指定節點、`proxy:true` 走代理池 |
+| `/stepped key stages` | **OWNER** / 授權管理員 | 階梯壓測：逐級加壓找出容量拐點，例 `50,100,200,400`；同樣支援 `nodes:` 與 `proxy:true` |
 | `/target add` | 授權管理員 | 提交目標，產生所有權驗證 token |
 | `/target verify` | 授權管理員 | 驗證域名所有權 |
 | `/target approve` | **OWNER** | 核准目標並設定併發／時長上限；`pending_verify` 狀態可直接核准（跳過驗證，記為 UNVERIFIED） |

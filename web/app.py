@@ -25,9 +25,10 @@ import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -44,6 +45,8 @@ except ImportError:  # 以 python web/app.py 啟動時
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 CONFIG_FILE = PROJECT_DIR / "config" / "nodes.json"
+TARGETS_FILE = PROJECT_DIR / "config" / "targets.json"
+PLANS_DIR = PROJECT_DIR / "plans"
 CRED_FILE = PROJECT_DIR / "config" / "credentials.json"
 DEPLOY_DIR = PROJECT_DIR / "deploy"
 STATIC_DIR = BASE_DIR / "static"
@@ -142,6 +145,25 @@ def save_config(data: dict) -> None:
     tmp.replace(CONFIG_FILE)
 
 
+def load_targets() -> dict:
+    if not TARGETS_FILE.exists():
+        return {"limits": {"global_max_threads": 5000, "global_max_duration": 1800},
+                "targets": {}}
+    with open(TARGETS_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    data.setdefault("targets", {})
+    data.setdefault("limits", {"global_max_threads": 5000, "global_max_duration": 1800})
+    return data
+
+
+def save_targets(data: dict) -> None:
+    tmp = TARGETS_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    tmp.replace(TARGETS_FILE)
+
+
 # ---------------------------------------------------------------- 節點憑證
 # 密碼以 WEB_TOKEN 派生金鑰加密存放：拿到檔案但沒有權杖無法解開。
 # 換掉 WEB_TOKEN 會使既有密碼失效，需重新輸入一次。
@@ -236,8 +258,8 @@ def write_admins(ids: list[str]) -> None:
         pass
 
 SLASH_COMMANDS = [
-    ("/start url port threads https-get", "一句話壓測：網址 埠 併發 協定-方法（OWNER 與授權管理員）"),
-    ("/stepped url 50,100,200,400", "階梯壓測：逐級加壓找出容量拐點（OWNER 與授權管理員）"),
+    ("/start key threads", "對已定義目標發起壓測：目標 併發（OWNER 與授權管理員）"),
+    ("/stepped key 50,100,200", "對已定義目標做階梯壓測，找出容量拐點"),
     ("/start … nodes: proxy:", "只指定部分節點，或走代理池模擬多來源 IP"),
     ("/target add", "提交壓測目標，產生所有權驗證 token"),
     ("/target verify", "驗證目標的域名所有權"),
@@ -945,6 +967,18 @@ class ProbeBody(BaseModel):
     ssh_port: int = 22
 
 
+class TargetBody(BaseModel):
+    key: Optional[str] = None
+    url: str
+    client: str = ""
+    plan: str = "oneshot.jmx"
+    max_threads: int = 600
+    max_duration: int = 1800
+    authorized_days: int = 30
+    authorized_until: Optional[str] = None
+    enabled: bool = True
+
+
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$")
 USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
@@ -1069,6 +1103,10 @@ async def get_state(_=Depends(require_auth)):
             "capacity": capacity,
         },
         "nodes": items,
+        "targets": [
+            _target_view(k, v)
+            for k, v in load_targets().get("targets", {}).items()
+        ],
         "job": job.summary() if job else None,
         "bot": await asyncio.to_thread(bot_status),
         "loadtest": await asyncio.to_thread(loadtest_status),
@@ -1168,6 +1206,192 @@ async def delete_node(key: str, request: Request, _=Depends(require_auth)):
     audit("NODE-DEL", request.client.host if request.client else "-",
           f"{key} {removed.get('host', '')}")
     return {"ok": True, "key": key, "nodes": len(nodes)}
+
+
+# ---------------------------------------------------------------- 壓測目標
+# 只有這裡定義的目標才能被 Discord 的 /start 與 /stepped 選用，
+# 指令端不再接受任意網址。
+
+def _target_key(host: str) -> str:
+    return (re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:40]) or "target"
+
+
+def validate_target(body: TargetBody) -> dict:
+    raw = (body.url or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="請填寫要壓測的完整網址")
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="網址只支援 http 或 https")
+    host = parsed.hostname or ""
+    if not host or not HOST_RE.match(host):
+        raise HTTPException(status_code=400, detail="網址中的域名格式不正確")
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="網址中的端口不正確")
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="端口需在 1 ~ 65535 之間")
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    plan = (body.plan or "").strip() or "oneshot.jmx"
+    if "/" in plan or "\\" in plan or not plan.endswith(".jmx"):
+        raise HTTPException(status_code=400, detail="計畫檔名不合法")
+    if not (PLANS_DIR / plan).exists():
+        raise HTTPException(status_code=400, detail=f"找不到計畫檔 plans/{plan}")
+
+    limits = load_targets().get("limits", {})
+    cap_t = int(limits.get("global_max_threads", 5000))
+    cap_d = int(limits.get("global_max_duration", 1800))
+    if not 1 <= body.max_threads <= cap_t:
+        raise HTTPException(status_code=400, detail=f"併發上限需在 1 ~ {cap_t} 之間")
+    if not 5 <= body.max_duration <= cap_d:
+        raise HTTPException(status_code=400, detail=f"時長上限需在 5 ~ {cap_d} 秒之間")
+    if not 1 <= body.authorized_days <= 365:
+        raise HTTPException(status_code=400, detail="授權天數需在 1 ~ 365 之間")
+
+    until = (body.authorized_until or "").strip()
+    if until:
+        try:
+            datetime.strptime(until, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="授權期限格式需為 YYYY-MM-DD")
+    else:
+        until = (datetime.now() + timedelta(days=body.authorized_days)).date().isoformat()
+
+    key = (body.key or "").strip() or _target_key(host)
+    if not KEY_RE.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail="名稱只能使用英數字、底線、連字號、點，需以英數字開頭，最長 32 字元",
+        )
+
+    return {
+        "key": key,
+        "domain": host,
+        "client": (body.client or "").strip()[:60],
+        "plan": plan,
+        "url": f"{scheme}://{host}" + (f":{port}" if port not in (80, 443) else "") + path,
+        "protocol": scheme,
+        "port": port,
+        "path": path,
+        "method": "GET",
+        "max_threads": body.max_threads,
+        "max_duration": body.max_duration,
+        "status": "approved" if body.enabled else "suspended",
+        "authorized_until": until,
+    }
+
+
+def _target_view(key: str, cfg: dict) -> dict:
+    return {
+        "key": key,
+        "domain": cfg.get("domain", ""),
+        "client": cfg.get("client", ""),
+        "plan": cfg.get("plan", ""),
+        "url": cfg.get("url") or cfg.get("last_url", ""),
+        "protocol": cfg.get("protocol", "https"),
+        "port": int(cfg.get("port") or cfg.get("last_port") or 443),
+        "path": cfg.get("path", "/"),
+        "max_threads": int(cfg.get("max_threads") or 0),
+        "max_duration": int(cfg.get("max_duration") or 0),
+        "status": cfg.get("status", "pending_verify"),
+        "authorized_until": cfg.get("authorized_until", ""),
+        "updated_at": cfg.get("updated_at", ""),
+        "ready": bool(cfg.get("url") or cfg.get("last_url")),
+    }
+
+
+@app.get("/api/targets")
+async def list_targets_api(_=Depends(require_auth)):
+    data = load_targets()
+    items = [_target_view(k, v) for k, v in data.get("targets", {}).items()]
+    items.sort(key=lambda x: x["key"])
+    plans = sorted(p.name for p in PLANS_DIR.glob("*.jmx"))
+    return {"items": items, "plans": plans, "limits": data.get("limits", {})}
+
+
+@app.post("/api/targets")
+async def create_target(body: TargetBody, request: Request, _=Depends(require_auth)):
+    data = validate_target(body)
+    store = load_targets()
+    targets = store.setdefault("targets", {})
+    if data["key"] in targets:
+        raise HTTPException(status_code=409, detail=f"目標 {data['key']} 已存在")
+    now = datetime.now().isoformat(timespec="seconds")
+    targets[data["key"]] = {
+        **data,
+        "token": "",
+        "submitted_by": "web",
+        "submitted_at": now,
+        "verification": "web_defined",
+        "approved_by": "web",
+        "approved_at": now,
+        "created_by": "web",
+        "created_at": now,
+        "updated_at": now,
+    }
+    save_targets(store)
+    audit("TARGET-ADD", request.client.host if request.client else "-",
+          f"{data['key']} {data['url']} threads={data['max_threads']} plan={data['plan']}")
+    return {"ok": True, "key": data["key"], "targets": len(targets)}
+
+
+@app.put("/api/targets/{key}")
+async def update_target(key: str, body: TargetBody, request: Request, _=Depends(require_auth)):
+    data = validate_target(body)
+    store = load_targets()
+    targets = store.get("targets", {})
+    if key not in targets:
+        raise HTTPException(status_code=404, detail="目標不存在")
+    new_key = data["key"]
+    if new_key != key and new_key in targets:
+        raise HTTPException(status_code=409, detail=f"目標 {new_key} 已存在")
+
+    old = targets[key]
+    merged = {
+        **old,
+        **data,
+        # 保留既有治理欄位
+        "token": old.get("token", ""),
+        "submitted_by": old.get("submitted_by", "web"),
+        "submitted_at": old.get("submitted_at", ""),
+        "verification": old.get("verification", "web_defined"),
+        "approved_by": old.get("approved_by", "web"),
+        "approved_at": old.get("approved_at", ""),
+        "created_by": old.get("created_by", "web"),
+        "created_at": old.get("created_at", ""),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if new_key != key:
+        rebuilt = {}
+        for k, v in targets.items():
+            rebuilt[new_key if k == key else k] = merged if k == key else v
+        store["targets"] = rebuilt
+    else:
+        targets[key] = merged
+    save_targets(store)
+    audit("TARGET-EDIT", request.client.host if request.client else "-",
+          f"{key}->{new_key} {data['url']} threads={data['max_threads']} status={data['status']}")
+    return {"ok": True, "key": new_key, "renamed": new_key != key}
+
+
+@app.delete("/api/targets/{key}")
+async def delete_target(key: str, request: Request, _=Depends(require_auth)):
+    store = load_targets()
+    targets = store.get("targets", {})
+    if key not in targets:
+        raise HTTPException(status_code=404, detail="目標不存在")
+    removed = targets.pop(key)
+    save_targets(store)
+    audit("TARGET-DEL", request.client.host if request.client else "-",
+          f"{key} {removed.get('domain', '')}")
+    return {"ok": True, "key": key, "targets": len(targets)}
 
 
 @app.post("/api/probe")

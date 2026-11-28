@@ -412,9 +412,11 @@ target_group = app_commands.Group(name="target", description="壓測目標管理
 
 
 @target_group.command(name="add", description="提交壓測目標，系統會產生所有權驗證 token")
-@app_commands.describe(domain="客戶域名，例如 example.com", client="客戶名稱", plan="壓測計畫檔名")
+@app_commands.describe(domain="客戶域名，例如 example.com", client="客戶名稱",
+                       plan="壓測計畫檔名",
+                       url="要壓測的完整網址，留空則用 https://域名/")
 async def target_add(interaction: discord.Interaction, domain: str, client: str,
-                     plan: str = "baseline.jmx"):
+                     plan: str = "baseline.jmx", url: str = ""):
     if not is_staff(interaction.user.id):
         await interaction.response.send_message("你沒有使用權限。", ephemeral=True)
         audit("DENY", str(interaction.user), f"target add {domain}")
@@ -436,6 +438,23 @@ async def target_add(interaction: discord.Interaction, domain: str, client: str,
             f"計畫檔 `{plan}` 不存在於 plans/ 目錄。", ephemeral=True
         )
         return
+
+    # 網址一併存進目標：/start 與 /stepped 只從目標取網址，不接受臨時輸入
+    raw_url = (url or "").strip() or f"https://{domain}/"
+    if "://" not in raw_url:
+        raw_url = f"https://{raw_url}"
+    parsed_url = urlparse(raw_url)
+    if (parsed_url.scheme not in ("http", "https")
+            or (parsed_url.hostname or "").lower() != domain):
+        await interaction.response.send_message(
+            f"網址需為 `http(s)://{domain}/...`，目前是 `{raw_url}`。", ephemeral=True
+        )
+        return
+    target_protocol = parsed_url.scheme
+    target_port = parsed_url.port or (443 if target_protocol == "https" else 80)
+    target_path = parsed_url.path or "/"
+    if parsed_url.query:
+        target_path = f"{target_path}?{parsed_url.query}"
 
     data = load_targets()
     key = domain.replace(".", "-")
@@ -461,6 +480,11 @@ async def target_add(interaction: discord.Interaction, domain: str, client: str,
         "domain": domain,
         "client": client,
         "plan": plan,
+        "url": raw_url,
+        "protocol": target_protocol,
+        "port": target_port,
+        "path": target_path,
+        "method": "GET",
         "status": "pending_verify",
         "token": token,
         "submitted_by": str(interaction.user),
@@ -804,59 +828,88 @@ def make_key(host: str) -> str:
     return (re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:40]) or "target"
 
 
-@tree.command(name="start", description="一句話發起壓測（OWNER 與網站授權的管理員）")
+def target_request_spec(target: dict) -> tuple:
+    """從網頁定義的目標取出 (protocol, port, path, method, url)。
+
+    網址由網頁控制台設定，Discord 端不再接受臨時輸入的網址。
+    """
+    raw = (target.get("url") or target.get("last_url") or "").strip()
+    if not raw:
+        raise ValueError("此目標尚未設定網址，請到網頁控制台編輯後再試")
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    protocol = parsed.scheme if parsed.scheme in ("http", "https") else "https"
+    try:
+        port = int(target.get("port") or parsed.port or (443 if protocol == "https" else 80))
+    except (TypeError, ValueError):
+        port = 443 if protocol == "https" else 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    method = (target.get("method") or target.get("last_method") or "GET").upper()
+    return protocol, port, path, method, raw
+
+
+def pick_target(key: str) -> tuple:
+    """取出可用的目標，回傳 (targets 資料, target)。不可用時丟 ValueError。"""
+    data = load_targets()
+    targets = data.get("targets", {})
+    target = targets.get(key)
+    if not target:
+        raise ValueError(
+            f"找不到目標 `{key}`。\n"
+            "目標只能在網頁控制台的「壓測目標」新增，建立後才能在這裡選用。"
+        )
+    if target.get("status") != "approved":
+        raise ValueError(
+            f"目標 `{key}` 目前狀態為 `{target.get('status')}`，不可壓測。\n"
+            "請到網頁控制台啟用。"
+        )
+    until = target.get("authorized_until")
+    if until and until < datetime.now().date().isoformat():
+        raise ValueError(f"目標 `{key}` 授權已於 {until} 到期，請到網頁控制台延長。")
+    return data, target
+
+
+@tree.command(name="start", description="對網頁控制台預先定義的目標發起壓測")
 @app_commands.describe(
-    url="完整網址，例 https://example.com/login/index.php",
-    port="連接埠，例 443",
+    key="目標（只能選網頁控制台已定義並啟用的目標）",
     threads="併發執行緒數，例 300",
-    mode="協定與方法，例 https-get / https-post / http-get",
     duration="持續秒數，預設 60",
     nodes="只使用指定節點，逗號分隔，例 HK-Huawei,hk-huawei2；留空為全部",
     proxy="透過代理池發壓，模擬多來源 IP（需先填 config/proxies.txt）",
 )
-async def start_cmd(interaction: discord.Interaction, url: str, port: int,
-                    threads: int, mode: str = "https-get", duration: int = 60,
-                    nodes: str = "", proxy: bool = False):
+@app_commands.autocomplete(key=target_autocomplete)
+async def start_cmd(interaction: discord.Interaction, key: str, threads: int,
+                    duration: int = 60, nodes: str = "", proxy: bool = False):
     uid = interaction.user.id
     if not is_admin(uid):
         await interaction.response.send_message(
             "你沒有權限。只有 OWNER 與網站授權的管理員可以發起壓測。", ephemeral=True)
-        audit("DENY-START", str(interaction.user), f"{url} {threads}x{duration}")
+        audit("DENY-START", str(interaction.user), f"{key} {threads}x{duration}")
         return
 
     try:
-        protocol, method = parse_mode(mode)
+        data, target = pick_target(key)
+        protocol, port, path, method, raw = target_request_spec(target)
     except ValueError as exc:
         await interaction.response.send_message(str(exc), ephemeral=True)
+        audit("DENY-START", str(interaction.user), f"{key} 目標不可用")
         return
 
-    raw = url.strip()
-    if "://" not in raw:
-        raw = f"{protocol}://{raw}"
-    parsed = urlparse(raw)
-    host = parsed.hostname or ""
-    if not host or "." not in host:
-        await interaction.response.send_message(
-            f"網址無法解析：`{url}`\n請用完整格式，例 `https://example.com/login/index.php`",
-            ephemeral=True)
-        return
-    if parsed.scheme in ("http", "https"):
-        protocol = parsed.scheme
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-
-    data = load_targets()
     limits = data.get("limits", {})
-    max_threads = int(limits.get("global_max_threads", 5000))
-    max_duration = int(limits.get("global_max_duration", 1800))
-    if not 1 <= threads <= max_threads:
+    global_t = int(limits.get("global_max_threads", 5000))
+    global_d = int(limits.get("global_max_duration", 1800))
+    cap_t = min(int(target.get("max_threads") or global_t), global_t)
+    cap_d = min(int(target.get("max_duration") or global_d), global_d)
+    if not 1 <= threads <= cap_t:
         await interaction.response.send_message(
-            f"併發須介於 1 ~ {max_threads}。", ephemeral=True)
+            f"目標 `{key}` 的併發上限是 **{cap_t}**，請調整 threads。", ephemeral=True)
         return
-    if not 5 <= duration <= max_duration:
+    if not 5 <= duration <= cap_d:
         await interaction.response.send_message(
-            f"時長須介於 5 ~ {max_duration} 秒。", ephemeral=True)
+            f"目標 `{key}` 的時長上限是 **{cap_d}** 秒，請調整 duration。", ephemeral=True)
         return
     if RUNNING["active"]:
         await interaction.response.send_message(
@@ -898,41 +951,17 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
             ephemeral=True)
         return
 
-    key = make_key(host)
-    now = datetime.now().isoformat(timespec="seconds")
-    target = data.setdefault("targets", {}).setdefault(key, {})
-    target.update(
-        domain=host,
-        client=target.get("client") or "即時壓測",
-        status="approved",
-        token=target.get("token", ""),
-        submitted_by=target.get("submitted_by") or str(interaction.user),
-        submitted_at=target.get("submitted_at") or now,
-        verified_at=target.get("verified_at"),
-        verification=target.get("verification") or "admin_start",
-        approved_by=str(interaction.user),
-        approved_at=now,
-        max_threads=threads,
-        max_duration=duration,
-        authorized_until=(datetime.now() + timedelta(days=1)).date().isoformat(),
-        last_url=raw,
-        last_port=port,
-        last_method=method,
-    )
-    # 既有目標已設定專屬計畫（如 moodle.jmx）時不要被一句話壓測覆寫，
-    # 否則之後的 /loadtest 會退化成只打單一 URL 的通用計畫。
-    if not target.get("plan"):
-        target["plan"] = "oneshot.jmx"
-    save_targets(data)
     mode_note = f" proxy={len(http_pool)}" if proxy else ""
     audit("START", str(interaction.user),
-          f"{key} {protocol}://{host}:{port}{path} {threads}x{duration}s {method}"
+          f"{key} {protocol}://{target.get('domain', '')}:{port}{path} "
+          f"{threads}x{duration}s {method}"
           f" nodes={','.join(k for k, _ in chosen)}{mode_note}")
 
     await interaction.response.defer()
     await interaction.followup.send(
-        f"**開始壓測** · `{protocol}://{host}:{port}{path}`\n"
-        f"{method} · 併發 **{threads}**（{len(chosen)} 節點 × {per_node}）"
+        f"**開始壓測** · `{raw}`\n"
+        f"目標 `{key}`（{target.get('client') or '—'}）· {method}\n"
+        f"併發 **{threads}**（{len(chosen)} 節點 × {per_node}）"
         f" · 持續 **{duration} 秒**\n"
         f"節點：{'、'.join(k for k, _ in chosen)}\n"
         + (f"來源：**{len(http_pool)} 個代理輪換**{socks_note}\n" if proxy else "")
@@ -942,7 +971,7 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
         interaction.channel, key, target, chosen, per_node, actual,
         duration, str(interaction.user), False,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
-        plan="oneshot-proxy.jmx" if proxy else "oneshot.jmx",
+        plan="oneshot-proxy.jmx" if proxy else (target.get("plan") or "oneshot.jmx"),
         global_extra={"proxylist": px.encode_for_jmeter(http_pool)} if proxy else None,
     )
 
@@ -1204,30 +1233,24 @@ async def execute_stepped(channel, key: str, target: dict, stages: list[int],
 
 
 @tree.command(name="stepped",
-              description="階梯壓測：逐級加壓找出容量拐點（OWNER 與網站授權的管理員）")
+              description="對網頁控制台預先定義的目標做階梯壓測，找出容量拐點")
 @app_commands.describe(
-    url="完整網址，例 https://example.com/login/index.php",
+    key="目標（只能選網頁控制台已定義並啟用的目標）",
     stages="各級併發，逗號分隔且遞增，例 50,100,200,400",
     duration="每級持續秒數，預設 60",
     gap="級間間隔秒數，預設 60（讓 WAF 限流重置）",
-    mode="協定與方法，例 https-get / https-post / http-get",
     nodes="只使用指定節點，逗號分隔；留空為全部",
     proxy="透過代理池發壓，模擬多來源 IP（需先填 config/proxies.txt）",
 )
-async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
-                      duration: int = 60, gap: int = 60, mode: str = "https-get",
+@app_commands.autocomplete(key=target_autocomplete)
+async def stepped_cmd(interaction: discord.Interaction, key: str, stages: str,
+                      duration: int = 60, gap: int = 60,
                       nodes: str = "", proxy: bool = False):
     uid = interaction.user.id
     if not is_admin(uid):
         await interaction.response.send_message(
             "你沒有權限。只有 OWNER 與網站授權的管理員可以發起壓測。", ephemeral=True)
-        audit("DENY-STEPPED", str(interaction.user), f"{url} {stages}")
-        return
-
-    try:
-        protocol, method = parse_mode(mode)
-    except ValueError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True)
+        audit("DENY-STEPPED", str(interaction.user), f"{key} {stages}")
         return
 
     try:
@@ -1236,27 +1259,19 @@ async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
 
-    raw = url.strip()
-    if "://" not in raw:
-        raw = f"{protocol}://{raw}"
-    parsed = urlparse(raw)
-    host = parsed.hostname or ""
-    if not host or "." not in host:
-        await interaction.response.send_message(
-            f"網址無法解析：`{url}`\n請用完整格式，例 `https://example.com/login/index.php`",
-            ephemeral=True)
+    try:
+        data, target = pick_target(key)
+        protocol, port, path, method, raw = target_request_spec(target)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        audit("DENY-STEPPED", str(interaction.user), f"{key} 目標不可用")
         return
-    if parsed.scheme in ("http", "https"):
-        protocol = parsed.scheme
-    path = parsed.path or "/"
-    if parsed.query:
-        path = f"{path}?{parsed.query}"
-    port = parsed.port or (443 if protocol == "https" else 80)
 
-    data = load_targets()
     limits = data.get("limits", {})
-    max_threads = int(limits.get("global_max_threads", 5000))
-    max_duration = int(limits.get("global_max_duration", 1800))
+    global_t = int(limits.get("global_max_threads", 5000))
+    global_d = int(limits.get("global_max_duration", 1800))
+    max_threads = min(int(target.get("max_threads") or global_t), global_t)
+    max_duration = min(int(target.get("max_duration") or global_d), global_d)
 
     peak = stage_list[-1]
     if peak > max_threads:
@@ -1311,42 +1326,18 @@ async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
             f"{dist.effective_capacity(node_map, only)}。", ephemeral=True)
         return
 
-    key = make_key(host)
-    now = datetime.now().isoformat(timespec="seconds")
-    target = data.setdefault("targets", {}).setdefault(key, {})
-    target.update(
-        domain=host,
-        client=target.get("client") or "階梯壓測",
-        status="approved",
-        token=target.get("token", ""),
-        submitted_by=target.get("submitted_by") or str(interaction.user),
-        submitted_at=target.get("submitted_at") or now,
-        verified_at=target.get("verified_at"),
-        verification=target.get("verification") or "admin_start",
-        approved_by=str(interaction.user),
-        approved_at=now,
-        max_threads=max(int(target.get("max_threads") or 0), peak),
-        max_duration=max(int(target.get("max_duration") or 0), duration),
-        authorized_until=(datetime.now() + timedelta(days=1)).date().isoformat(),
-        last_url=raw,
-        last_port=port,
-        last_method=method,
-    )
-    if not target.get("plan"):
-        target["plan"] = "oneshot.jmx"
-    save_targets(data)
-
     total_secs = len(stage_list) * duration + (len(stage_list) - 1) * gap
     mode_note = f" proxy={len(http_pool)}" if proxy else ""
     audit("STEPPED-START", str(interaction.user),
-          f"{key} {protocol}://{host}:{port}{path} stages={stages} "
+          f"{key} {protocol}://{target.get('domain', '')}:{port}{path} stages={stages} "
           f"{duration}s gap={gap}s {method}"
           f" nodes={','.join(k for k, _ in chosen)}{mode_note}")
 
     await interaction.response.defer()
     await interaction.followup.send(
-        f"**開始階梯壓測** · `{protocol}://{host}:{port}{path}`\n"
-        f"{method} · 各級 **{' → '.join(map(str, stage_list))}** 併發\n"
+        f"**開始階梯壓測** · `{raw}`\n"
+        f"目標 `{key}`（{target.get('client') or '—'}）· {method}\n"
+        f"各級 **{' → '.join(map(str, stage_list))}** 併發\n"
         f"每級 {duration}s · 間隔 {gap}s · 預計 {total_secs}s\n"
         f"節點：{'、'.join(k for k, _ in chosen)}\n"
         + (f"來源：**{len(http_pool)} 個代理輪換**{socks_note}\n" if proxy else "")
@@ -1356,7 +1347,7 @@ async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
         interaction.channel, key, target, stage_list, duration, gap,
         str(interaction.user), url=raw, only=only,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
-        plan="oneshot-proxy.jmx" if proxy else "oneshot.jmx",
+        plan="oneshot-proxy.jmx" if proxy else (target.get("plan") or "oneshot.jmx"),
         global_extra={"proxylist": px.encode_for_jmeter(http_pool)} if proxy else None,
     )
 

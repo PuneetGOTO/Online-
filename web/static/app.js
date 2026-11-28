@@ -120,6 +120,7 @@ function renderState(state) {
   }
 
   renderNodes(nodes, job);
+  renderTargets(state.targets);
   renderBot(state.bot);
   renderLoadtest(state.loadtest);
   if (job) renderJobChip(job);
@@ -877,6 +878,207 @@ setInterval(() => {
   $('#lt-bar').style.width =
     `${duration ? Math.min(100, (elapsed / duration) * 100).toFixed(1) : 0}%`;
 }, 1000);
+
+/* ---------------------------------------------------------------- 壓測目標 */
+
+let latestTargets = [];
+let targetPlans = [];
+let editingTargetKey = null;
+
+function renderTargets(targets) {
+  latestTargets = targets || [];
+  const list = $('#targets-list');
+  const count = $('#target-count');
+  if (!latestTargets.length) {
+    list.innerHTML = '<div class="results-empty">尚無目標，請先新增要壓測的網站</div>';
+    count.textContent = '0 個';
+    return;
+  }
+  count.textContent = `${latestTargets.length} 個`;
+  list.innerHTML = latestTargets.map((t) => {
+    const active = t.status === 'approved';
+    const badge = active
+      ? '<span class="badge ok">可壓測</span>'
+      : `<span class="badge err">${esc(t.status)}</span>`;
+    const expired = t.authorized_until && t.authorized_until < new Date().toISOString().slice(0, 10);
+    return `
+      <article class="target-row ${active ? '' : 'off'}">
+        <div class="target-main">
+          <div class="target-head">
+            <span class="target-name">${esc(t.key)}</span>
+            ${badge}
+            ${expired ? '<span class="badge err">已過期</span>' : ''}
+            ${t.client ? `<span class="region">${esc(t.client)}</span>` : ''}
+          </div>
+          <div class="target-url mono">${esc(t.url || '（未設定網址）')}</div>
+          <div class="target-meta">
+            <span>計畫 <b>${esc(t.plan || '—')}</b></span>
+            <span>併發上限 <b>${t.max_threads}</b></span>
+            <span>時長上限 <b>${t.max_duration}s</b></span>
+            <span>授權至 <b>${esc(t.authorized_until || '—')}</b></span>
+          </div>
+        </div>
+        <div class="target-actions">
+          <label class="switch" title="${active ? '已啟用' : '已停用'}">
+            <input type="checkbox" data-act="toggle-target" data-key="${esc(t.key)}" ${active ? 'checked' : ''}>
+            <span class="slider"></span>
+          </label>
+          <button class="icon-mini" data-act="edit-target" data-key="${esc(t.key)}" title="編輯">${ICON_EDIT}</button>
+          <button class="icon-mini danger" data-act="delete-target" data-key="${esc(t.key)}" title="刪除">${ICON_TRASH}</button>
+        </div>
+      </article>`;
+  }).join('');
+}
+
+async function ensureTargetPlans() {
+  if (targetPlans.length) return;
+  try {
+    const data = await api('/api/targets');
+    targetPlans = data.plans || [];
+  } catch (err) {
+    console.warn('[plans]', err.message);
+    return;
+  }
+  const select = $('#target-plan');
+  const current = select.value;
+  select.innerHTML = targetPlans
+    .map((p) => `<option value="${esc(p)}">${esc(p)}</option>`)
+    .join('');
+  if (current && targetPlans.includes(current)) select.value = current;
+}
+
+const targetForm = $('#target-form');
+
+$('#btn-add-target').addEventListener('click', () => openTargetModal(null));
+$('#target-modal-close').addEventListener('click', closeTargetModal);
+$('#btn-target-cancel').addEventListener('click', closeTargetModal);
+$('#target-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'target-modal') closeTargetModal();
+});
+
+$('#targets-list').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-act]');
+  if (!button) return;
+  const key = button.dataset.key;
+  const target = latestTargets.find((item) => item.key === key);
+  if (!target) return;
+  const act = button.dataset.act;
+
+  if (act === 'edit-target') {
+    openTargetModal(key);
+  } else if (act === 'delete-target') {
+    if (!confirm(`刪除目標 ${key}？之後 Discord 將無法選用它。`)) return;
+    try {
+      await api(`/api/targets/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      await refreshState();
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+});
+
+$('#targets-list').addEventListener('change', async (event) => {
+  const input = event.target.closest('[data-act="toggle-target"]');
+  if (!input) return;
+  const key = input.dataset.key;
+  const target = latestTargets.find((item) => item.key === key);
+  if (!target) return;
+  try {
+    await api(`/api/targets/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        key: target.key,
+        url: target.url,
+        client: target.client || '',
+        plan: target.plan,
+        max_threads: target.max_threads,
+        max_duration: target.max_duration,
+        authorized_until: target.authorized_until,
+        enabled: input.checked,
+      }),
+    });
+    await refreshState();
+  } catch (err) {
+    alert(err.message);
+    input.checked = !input.checked;
+  }
+});
+
+async function openTargetModal(key) {
+  editingTargetKey = key;
+  await ensureTargetPlans();
+  targetForm.reset();
+  targetForm.max_threads.value = '600';
+  targetForm.max_duration.value = '600';
+  targetForm.authorized_days.value = '30';
+  targetForm.enabled.checked = true;
+  setTargetStatus('', '');
+  $('#target-modal-title').textContent = key ? `編輯目標 · ${key}` : '新增目標';
+
+  if (key) {
+    const target = latestTargets.find((item) => item.key === key);
+    if (target) {
+      targetForm.url.value = target.url || '';
+      targetForm.key.value = target.key;
+      targetForm.client.value = target.client || '';
+      if (target.plan && targetPlans.includes(target.plan)) targetForm.plan.value = target.plan;
+      targetForm.max_threads.value = target.max_threads;
+      targetForm.max_duration.value = target.max_duration;
+      targetForm.enabled.checked = target.status === 'approved';
+    }
+  }
+  $('#target-modal').classList.remove('hidden');
+  setTimeout(() => targetForm.url.focus(), 50);
+}
+
+function closeTargetModal() {
+  $('#target-modal').classList.add('hidden');
+  editingTargetKey = null;
+}
+
+function setTargetStatus(text, cls) {
+  const element = $('#target-form-status');
+  element.textContent = text;
+  element.className = 'form-status span2' + (cls ? ' ' + cls : '');
+}
+
+targetForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const payload = {
+    url: targetForm.url.value.trim(),
+    key: targetForm.key.value.trim() || null,
+    client: targetForm.client.value.trim(),
+    plan: targetForm.plan.value,
+    max_threads: Number(targetForm.max_threads.value),
+    max_duration: Number(targetForm.max_duration.value),
+    authorized_days: Number(targetForm.authorized_days.value),
+    enabled: targetForm.enabled.checked,
+  };
+  if (editingTargetKey) {
+    const existing = latestTargets.find((item) => item.key === editingTargetKey);
+    if (existing && existing.authorized_until) {
+      payload.authorized_until = existing.authorized_until;
+    }
+  }
+  $('#btn-target-save').disabled = true;
+  setTargetStatus('儲存中…', '');
+  try {
+    if (editingTargetKey) {
+      await api(`/api/targets/${encodeURIComponent(editingTargetKey)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+    } else {
+      await api('/api/targets', { method: 'POST', body: JSON.stringify(payload) });
+    }
+    closeTargetModal();
+    await refreshState();
+  } catch (err) {
+    setTargetStatus(err.message, 'err');
+  } finally {
+    $('#btn-target-save').disabled = false;
+  }
+});
 
 /* ---------------------------------------------------------------- 壓測報告 */
 
