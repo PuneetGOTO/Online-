@@ -1294,6 +1294,7 @@ def _target_view(key: str, cfg: dict) -> dict:
         "domain": cfg.get("domain", ""),
         "client": cfg.get("client", ""),
         "plan": cfg.get("plan", ""),
+        "plan_label": PLAN_META.get(cfg.get("plan", ""), {}).get("label") or cfg.get("plan", ""),
         "url": cfg.get("url") or cfg.get("last_url", ""),
         "protocol": cfg.get("protocol", "https"),
         "port": int(cfg.get("port") or cfg.get("last_port") or 443),
@@ -1307,12 +1308,58 @@ def _target_view(key: str, cfg: dict) -> dict:
     }
 
 
+# 計畫說明：讓控制台的下拉選單能顯示用途，而不是只有檔名。
+# 新增 .jmx 時在這裡補一筆即可；沒登記的會退回顯示檔名。
+PLAN_META = {
+    "oneshot.jmx": {
+        "label": "通用 · 單一請求",
+        "group": "通用（任何網址）",
+        "desc": "只打目標網址的一個請求，沒有思考時間，吞吐最高。適合量測容量上限。",
+        "note": "",
+        "badge": "推薦",
+    },
+    "oneshot-proxy.jmx": {
+        "label": "通用 · 單一請求 + 代理",
+        "group": "通用（任何網址）",
+        "desc": "同上，但請求經代理池發出，模擬大量不同來源 IP。",
+        "note": "代理為單一輪換入口時，低速率多 IP 有效，高併發會被閘道重複用 IP 拖垮。",
+        "badge": "多 IP",
+    },
+    "baseline.jmx": {
+        "label": "基線 · Nextcloud 兩端點",
+        "group": "固定端點基線",
+        "desc": "固定打 /login 與 /status.php，含 HTTP 200 斷言與 500ms 思考時間。適合前後對比。",
+        "note": "端點寫死在計畫裡，控制台填的網址只會用到域名。",
+        "badge": "固定端點",
+    },
+    "moodle.jmx": {
+        "label": "基線 · Moodle 兩端點",
+        "group": "固定端點基線",
+        "desc": "固定打 /login/index.php 與 /，含 HTTP 200 斷言與 500ms 思考時間。適合前後對比。",
+        "note": "端點寫死在計畫裡，控制台填的網址只會用到域名。",
+        "badge": "固定端點",
+    },
+}
+
+
+def _plan_info(name: str) -> dict:
+    meta = PLAN_META.get(name, {})
+    return {
+        "value": name,
+        "label": meta.get("label") or name,
+        "group": meta.get("group") or "其他",
+        "desc": meta.get("desc") or "自訂計畫檔。",
+        "note": meta.get("note") or "",
+        "badge": meta.get("badge") or "",
+    }
+
+
 @app.get("/api/targets")
 async def list_targets_api(_=Depends(require_auth)):
     data = load_targets()
     items = [_target_view(k, v) for k, v in data.get("targets", {}).items()]
     items.sort(key=lambda x: x["key"])
-    plans = sorted(p.name for p in PLANS_DIR.glob("*.jmx"))
+    plans = [_plan_info(p.name) for p in sorted(PLANS_DIR.glob("*.jmx"))]
     return {"items": items, "plans": plans, "limits": data.get("limits", {})}
 
 

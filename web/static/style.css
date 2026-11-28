@@ -714,3 +714,29 @@ main { max-width: 1180px; margin: 0 auto; padding: 22px 24px 64px; }
   padding-top: 1px;
 }
 .target-actions .switch { margin-left: 0; }
+
+/* 計畫說明 */
+.plan-hint {
+  display: block;
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-soft);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.plan-hint:empty { display: none; }
+.plan-desc { display: block; color: var(--text-soft); }
+.plan-note {
+  display: block;
+  margin-top: 4px;
+  color: var(--warn);
+}
+.plan-file {
+  display: block;
+  margin-top: 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}

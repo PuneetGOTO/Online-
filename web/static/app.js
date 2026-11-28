@@ -912,7 +912,7 @@ function renderTargets(targets) {
           </div>
           <div class="target-url mono">${esc(t.url || '（未設定網址）')}</div>
           <div class="target-meta">
-            <span>計畫 <b>${esc(t.plan || '—')}</b></span>
+            <span title="${esc(t.plan || '')}">計畫 <b>${esc(t.plan_label || t.plan || '—')}</b></span>
             <span>併發上限 <b>${t.max_threads}</b></span>
             <span>時長上限 <b>${t.max_duration}s</b></span>
             <span>授權至 <b>${esc(t.authorized_until || '—')}</b></span>
@@ -941,11 +941,40 @@ async function ensureTargetPlans() {
   }
   const select = $('#target-plan');
   const current = select.value;
-  select.innerHTML = targetPlans
-    .map((p) => `<option value="${esc(p)}">${esc(p)}</option>`)
-    .join('');
-  if (current && targetPlans.includes(current)) select.value = current;
+  const groups = new Map();
+  targetPlans.forEach((p) => {
+    if (!groups.has(p.group)) groups.set(p.group, []);
+    groups.get(p.group).push(p);
+  });
+  select.innerHTML = [...groups.entries()].map(([group, items]) => {
+    const opts = items.map((p) =>
+      `<option value="${esc(p.value)}">${esc(p.label)}${p.badge ? '（' + esc(p.badge) + '）' : ''}</option>`
+    ).join('');
+    return `<optgroup label="${esc(group)}">${opts}</optgroup>`;
+  }).join('');
+  if (current && targetPlans.some((p) => p.value === current)) select.value = current;
+  updatePlanHint();
 }
+
+function currentPlanInfo() {
+  return targetPlans.find((p) => p.value === $('#target-plan').value) || null;
+}
+
+function updatePlanHint() {
+  const hint = $('#plan-hint');
+  if (!hint) return;
+  const info = currentPlanInfo();
+  if (!info) {
+    hint.innerHTML = '';
+    return;
+  }
+  hint.innerHTML =
+    `<span class="plan-desc">${esc(info.desc)}</span>` +
+    (info.note ? `<span class="plan-note">注意：${esc(info.note)}</span>` : '') +
+    `<span class="plan-file">${esc(info.value)}</span>`;
+}
+
+$('#target-plan').addEventListener('change', updatePlanHint);
 
 const targetForm = $('#target-form');
 
@@ -1021,13 +1050,16 @@ async function openTargetModal(key) {
       targetForm.url.value = target.url || '';
       targetForm.key.value = target.key;
       targetForm.client.value = target.client || '';
-      if (target.plan && targetPlans.includes(target.plan)) targetForm.plan.value = target.plan;
+      if (target.plan && targetPlans.some((p) => p.value === target.plan)) {
+        targetForm.plan.value = target.plan;
+      }
       targetForm.max_threads.value = target.max_threads;
       targetForm.max_duration.value = target.max_duration;
       targetForm.enabled.checked = target.status === 'approved';
     }
   }
   $('#target-modal').classList.remove('hidden');
+  updatePlanHint();
   setTimeout(() => targetForm.url.focus(), 50);
 }
 
