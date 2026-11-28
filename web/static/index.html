@@ -29,7 +29,7 @@
     </div>
     <div class="login-kicker">LOADTEST CONTROL PLANE</div>
     <h1>節點控制台</h1>
-    <p class="muted">請使用管理員或操作員帳號登入系統。</p>
+    <p class="muted">請使用系統核發的帳號密碼登入控制台。</p>
 
     <div class="auth-field">
       <label class="auth-label" for="login-username">管理帳號</label>
@@ -198,34 +198,34 @@
     </div>
 
     <nav class="sidebar-nav" aria-label="主選單">
-      <div class="nav-group-label">工作區</div>
+      <div class="nav-group-label" data-nav-group="main">工作區</div>
       <button type="button" class="nav-item active" data-nav="overview">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
         <span class="nav-label">總覽儀表板</span>
       </button>
-      <button type="button" class="nav-item" data-nav="nodes">
+      <button type="button" class="nav-item" data-nav="nodes" data-req-perm="nodes">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6.5" cy="6.5" r="1"/><circle cx="6.5" cy="17.5" r="1"/></svg>
         <span class="nav-label">伺服器節點</span>
         <span class="nav-badge" id="nav-badge-nodes">—</span>
       </button>
-      <button type="button" class="nav-item" data-nav="targets">
+      <button type="button" class="nav-item" data-nav="targets" data-req-perm="targets">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/></svg>
         <span class="nav-label">壓測目標</span>
         <span class="nav-badge" id="nav-badge-targets">—</span>
       </button>
-      <button type="button" class="nav-item" data-nav="reports">
+      <button type="button" class="nav-item" data-nav="reports" data-req-perm="reports">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
         <span class="nav-label">壓測報告</span>
         <span class="nav-badge" id="nav-badge-reports">—</span>
       </button>
 
-      <div class="nav-group-label">自動化與日誌</div>
-      <button type="button" class="nav-item" data-nav="bot">
+      <div class="nav-group-label" data-nav-group="ops">自動化與日誌</div>
+      <button type="button" class="nav-item" data-nav="bot" data-req-perm="bot">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="3"/><path d="M12 7V3"/><circle cx="12" cy="2.5" r="1"/><circle cx="9" cy="13" r="1.2"/><circle cx="15" cy="13" r="1.2"/><path d="M9.5 16.5h5"/></svg>
         <span class="nav-label">Discord 機器人</span>
         <span class="nav-dot" id="nav-badge-bot"></span>
       </button>
-      <button type="button" class="nav-item" data-nav="deploy">
+      <button type="button" class="nav-item" data-nav="deploy" data-req-perm="deploy">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         <span class="nav-label">部署終端</span>
         <span class="nav-badge" id="nav-badge-deploy">閒置</span>
@@ -288,7 +288,7 @@
 
     <main id="workspace" class="workspace" data-view="overview">
       <!-- 統計 KPI -->
-      <section class="stats" data-section="stats">
+      <section class="stats" data-section="stats" data-req-perm="status">
         <div class="stat stat-online">
           <div class="stat-top">
             <span class="stat-label">在線節點</span>
@@ -332,7 +332,7 @@
       </section>
 
       <!-- 即時壓測狀態橫幅 -->
-      <section class="panel lt-panel idle" id="lt-panel" data-section="loadtest">
+      <section class="panel lt-panel idle" id="lt-panel" data-section="loadtest" data-req-perm="status">
         <div class="lt-left">
           <div class="lt-head">
             <span class="lt-dot" id="lt-dot"></span>
@@ -349,18 +349,19 @@
       </section>
 
       <!-- 伺服器節點區塊 -->
-      <div class="section-block" data-section="nodes">
+      <div class="section-block" data-section="nodes" data-req-perm="nodes">
         <section class="actionbar">
           <div class="actionbar-left">
             <div class="actionbar-title">
               <h2>伺服器節點</h2>
               <span class="muted mono" id="node-count"></span>
+              <span class="readonly-pill">唯讀模式</span>
             </div>
-            <p class="actionbar-hint" id="action-hint">
+            <p class="actionbar-hint op-only" id="action-hint">
               透過 SSH 執行 <code>deploy/setup-node.sh</code>，支援冪等重複部署。
             </p>
           </div>
-          <div class="actionbar-right">
+          <div class="actionbar-right op-only">
             <label class="check">
               <input type="checkbox" id="include-disabled">
               <span>含已停用</span>
@@ -380,9 +381,9 @@
       </div>
 
       <!-- 雙欄 Bento：壓測目標 + 壓測報告 -->
-      <div class="bento-two" data-section="bento-mid">
+      <div class="bento-two" id="bento-mid" data-section="bento-mid">
         <!-- 壓測目標 -->
-        <section class="panel targets-panel" data-section="targets">
+        <section class="panel targets-panel" data-section="targets" data-req-perm="targets">
           <div class="panel-head">
             <div class="panel-title-wrap">
               <h2>壓測目標</h2>
@@ -390,7 +391,7 @@
             </div>
             <span class="spacer"></span>
             <span class="results-hint">Discord 僅可選用啟用項目</span>
-            <button class="btn primary small" id="btn-add-target">新增目標</button>
+            <button class="btn primary small op-only" id="btn-add-target">新增目標</button>
           </div>
           <div class="targets-list" id="targets-list">
             <div class="results-empty">尚無目標，請先新增要壓測的網站</div>
@@ -398,7 +399,7 @@
         </section>
 
         <!-- 壓測報告 -->
-        <section class="panel results-panel" data-section="reports">
+        <section class="panel results-panel" data-section="reports" data-req-perm="reports">
           <div class="panel-head">
             <div class="panel-title-wrap">
               <h2>壓測報告</h2>
@@ -414,21 +415,22 @@
       </div>
 
       <!-- Discord 機器人 -->
-      <section class="panel bot-panel" data-section="bot">
+      <section class="panel bot-panel" data-section="bot" data-req-perm="bot">
         <div class="panel-head">
           <div class="panel-title-wrap">
             <h2>Discord 機器人</h2>
             <span class="chip" id="bot-chip">讀取中</span>
+            <span class="readonly-pill">唯讀檢視</span>
           </div>
           <span class="spacer"></span>
-          <div class="btn-group">
+          <div class="btn-group op-only">
             <button class="btn small" id="btn-bot-stop">停止</button>
             <button class="btn small" id="btn-bot-restart">重啟</button>
             <button class="btn small primary" id="btn-bot-start">啟動</button>
           </div>
         </div>
         <div class="bot-body">
-          <form id="bot-form" class="bot-form" autocomplete="off">
+          <form id="bot-form" class="bot-form op-only" autocomplete="off">
             <label class="field span2">
               <span>Bot Token</span>
               <input name="token" type="password" placeholder="貼上 Discord Bot Token" autocomplete="new-password">
@@ -465,14 +467,14 @@
             <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
             <span>即時日誌</span>
             <span class="spacer"></span>
-            <button class="btn ghost small" id="btn-bot-clear-log">清空</button>
+            <button class="btn ghost small op-only" id="btn-bot-clear-log">清空</button>
           </div>
           <pre class="bot-log" id="bot-log">尚無日誌</pre>
         </div>
       </section>
 
       <!-- 部署輸出終端 -->
-      <section class="panel deploy-panel" id="deploy-panel" data-section="deploy">
+      <section class="panel deploy-panel" id="deploy-panel" data-section="deploy" data-req-perm="deploy">
         <div class="panel-head">
           <div class="panel-title-wrap">
             <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -480,11 +482,11 @@
             <span class="chip" id="job-chip">閒置</span>
           </div>
           <span class="spacer"></span>
-          <button class="btn danger-ghost small hidden" id="btn-cancel">中止任務</button>
-          <button class="btn ghost small" id="btn-clear-log">清空</button>
+          <button class="btn danger-ghost small hidden op-only" id="btn-cancel">中止任務</button>
+          <button class="btn ghost small op-only" id="btn-clear-log">清空</button>
         </div>
         <div class="log" id="log">
-          <div class="log-empty">尚無部署任務。點擊上方「一鍵部署全部節點」或單一節點的「部署」按鈕開始。</div>
+          <div class="log-empty">尚無部署任務。</div>
         </div>
       </section>
 
@@ -506,6 +508,7 @@
                   <div class="profile-display-name" id="profile-display-name">—</div>
                   <div class="profile-username mono" id="profile-username">@—</div>
                   <div class="profile-last-login" id="profile-last-login">最近登入：—</div>
+                  <div class="profile-perms" id="profile-perms"></div>
                 </div>
               </div>
               <form id="profile-form" class="account-form" autocomplete="off">
@@ -565,7 +568,7 @@
               <span class="chip" id="users-count">—</span>
             </div>
             <span class="spacer"></span>
-            <span class="results-hint">管理控制台登入帳號、角色權限與連線狀態</span>
+            <span class="results-hint">可指派管理員、操作員或唯讀查看者，並自訂可見頁面權限</span>
             <button type="button" class="btn primary small" id="btn-add-user">新增帳號</button>
           </div>
           <div class="users-list" id="users-list">
@@ -709,19 +712,76 @@
     <div class="form-body">
       <label class="field">
         <span>帳號名稱</span>
-        <input name="username" required minlength="2" maxlength="32" placeholder="ops-01">
+        <input name="username" required minlength="2" maxlength="32" placeholder="viewer-01">
       </label>
       <label class="field">
         <span>顯示名稱</span>
-        <input name="display_name" maxlength="40" placeholder="維運人員">
+        <input name="display_name" maxlength="40" placeholder="專案查看者">
       </label>
       <label class="field span2">
         <span>角色權限</span>
         <select name="role">
-          <option value="operator">操作員（可使用控制台功能，無帳號管理權限）</option>
-          <option value="admin">系統管理員（擁有完整帳號與系統管理權限）</option>
+          <option value="viewer">查看者（唯讀模式，僅可檢視下方勾選頁面，無任何操作權限）</option>
+          <option value="operator">操作員（可操作下方勾選的業務功能，無帳號管理權限）</option>
+          <option value="admin">系統管理員（擁有全部頁面與帳號管理完整權限）</option>
         </select>
       </label>
+
+      <div class="field span2">
+        <div class="perm-head">
+          <span>頁面可見權限（自訂此帳號可看到的模組）</span>
+          <div class="perm-presets">
+            <button type="button" class="btn small ghost" id="btn-perm-viewer">預設查看者</button>
+            <button type="button" class="btn small ghost" id="btn-perm-all">全選</button>
+          </div>
+        </div>
+        <div class="perm-grid" id="user-perm-grid">
+          <label class="perm-card">
+            <input type="checkbox" name="perm" value="status">
+            <span class="perm-card-copy">
+              <span class="perm-card-title">壓測狀態與總覽</span>
+              <span class="perm-card-desc">KPI 統計與即時壓測進度</span>
+            </span>
+          </label>
+          <label class="perm-card">
+            <input type="checkbox" name="perm" value="nodes">
+            <span class="perm-card-copy">
+              <span class="perm-card-title">伺服器節點狀態</span>
+              <span class="perm-card-desc">在線狀態、延遲走勢與上限</span>
+            </span>
+          </label>
+          <label class="perm-card">
+            <input type="checkbox" name="perm" value="targets">
+            <span class="perm-card-copy">
+              <span class="perm-card-title">壓測目標</span>
+              <span class="perm-card-desc">目標網站清單與授權上限</span>
+            </span>
+          </label>
+          <label class="perm-card">
+            <input type="checkbox" name="perm" value="reports">
+            <span class="perm-card-copy">
+              <span class="perm-card-title">壓測報告</span>
+              <span class="perm-card-desc">檢視與下載測試報告</span>
+            </span>
+          </label>
+          <label class="perm-card">
+            <input type="checkbox" name="perm" value="bot">
+            <span class="perm-card-copy">
+              <span class="perm-card-title">Discord 機器人</span>
+              <span class="perm-card-desc">上線狀態、指令與即時日誌</span>
+            </span>
+          </label>
+          <label class="perm-card">
+            <input type="checkbox" name="perm" value="deploy">
+            <span class="perm-card-copy">
+              <span class="perm-card-title">部署終端</span>
+              <span class="perm-card-desc">節點部署輸出與任務進度</span>
+            </span>
+          </label>
+        </div>
+        <span class="auth-hint-inline" id="perm-role-hint"></span>
+      </div>
+
       <div class="field span2">
         <span id="user-pwd-label">登入密碼（至少 8 碼）</span>
         <div class="pwd-gen-row">

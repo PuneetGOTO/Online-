@@ -137,6 +137,8 @@ function showAuthMode(mode) {
 
 function showLogin(setupRequired = false) {
   currentUser = null;
+  document.body.classList.remove('is-readonly');
+  delete document.body.dataset.role;
   $('#login').classList.remove('hidden');
   $('#app').classList.add('hidden');
   stopTimers();
@@ -151,6 +153,10 @@ function showApp() {
 function stopTimers() {
   if (stateTimer) { clearInterval(stateTimer); stateTimer = null; }
   if (jobTimer) { clearInterval(jobTimer); jobTimer = null; }
+  if (typeof resultsTimer !== 'undefined' && resultsTimer) {
+    clearInterval(resultsTimer);
+    resultsTimer = null;
+  }
 }
 
 function updateStrength(inputEl, meterEl) {
@@ -375,11 +381,11 @@ function renderState(state) {
     $('#btn-deploy-all').disabled = true;
   }
 
-  renderNodes(nodes, job);
-  renderTargets(state.targets);
-  renderBot(state.bot);
-  renderLoadtest(state.loadtest);
-  if (job) renderJobChip(job);
+  if (hasPerm('nodes')) renderNodes(nodes, job);
+  if (hasPerm('targets')) renderTargets(state.targets);
+  if (hasPerm('bot')) renderBot(state.bot);
+  if (hasPerm('status')) renderLoadtest(state.loadtest);
+  if (hasPerm('deploy') && job) renderJobChip(job);
 }
 
 function sparkline(history, key) {
@@ -447,10 +453,11 @@ function sparkline(history, key) {
 
 function renderNodes(nodes, job) {
   const grid = $('#node-grid');
+  const writable = canOperate();
   if (!nodes.length) {
     grid.innerHTML = `<div class="empty-state">
       <div>還沒有任何伺服器節點</div>
-      <button class="btn primary" data-act="add">新增第一台伺服器</button>
+      ${writable ? '<button class="btn primary" data-act="add">新增第一台伺服器</button>' : ''}
     </div>`;
     return;
   }
@@ -480,9 +487,13 @@ function renderNodes(nodes, job) {
           ? 'warn'
           : 'ok';
 
-    const sshBadge = node.ssh_ok
-      ? '<span class="badge ok">SSH 可用</span>'
-      : '<span class="badge err">SSH 不通</span>';
+    const sshBadge = writable
+      ? (node.ssh_ok
+        ? '<span class="badge ok">SSH 可用</span>'
+        : '<span class="badge err">SSH 不通</span>')
+      : (node.online
+        ? '<span class="badge ok">節點在線</span>'
+        : '<span class="badge err">節點離線</span>');
 
     const deployStatus = busy && job.nodes && job.nodes[node.key]
       ? `<span class="badge warn">${esc(job.nodes[node.key])}</span>`
@@ -496,17 +507,17 @@ function renderNodes(nodes, job) {
           <span class="dot ${node.online ? 'online' : 'offline'}"></span>
           <span class="node-name">${esc(node.key)}</span>
           <span class="region">${esc(node.region)}</span>
-          <label class="switch" title="${node.enabled ? '已啟用' : '已停用'}">
+          ${writable ? `<label class="switch" title="${node.enabled ? '已啟用' : '已停用'}">
             <input type="checkbox" data-act="toggle" data-key="${esc(node.key)}" ${node.enabled ? 'checked' : ''}>
             <span class="slider"></span>
-          </label>
+          </label>` : `<span class="badge ${node.enabled ? 'ok' : 'err'}" style="margin-left:auto">${node.enabled ? '已啟用' : '已停用'}</span>`}
         </div>
         <div class="node-host">
           <span class="addr mono">${esc(addr)}</span>
           <span class="host-actions">
             <button class="icon-mini" data-act="copy" data-addr="${esc(addr)}" title="複製位址">${ICON_COPY}</button>
-            <button class="icon-mini" data-act="edit" data-key="${esc(node.key)}" title="編輯">${ICON_EDIT}</button>
-            <button class="icon-mini danger" data-act="delete" data-key="${esc(node.key)}" title="刪除">${ICON_TRASH}</button>
+            ${writable ? `<button class="icon-mini" data-act="edit" data-key="${esc(node.key)}" title="編輯">${ICON_EDIT}</button>
+            <button class="icon-mini danger" data-act="delete" data-key="${esc(node.key)}" title="刪除">${ICON_TRASH}</button>` : ''}
           </span>
         </div>
         <div class="node-metrics">
@@ -529,8 +540,8 @@ function renderNodes(nodes, job) {
         <div class="node-foot">
           ${deployStatus}
           <span class="spacer"></span>
-          <button class="btn small" data-act="inspect" data-key="${esc(node.key)}">檢查</button>
-          <button class="btn small" data-act="deploy" data-key="${esc(node.key)}" ${busy ? 'disabled' : ''}>部署</button>
+          ${writable ? `<button class="btn small" data-act="inspect" data-key="${esc(node.key)}">檢查</button>
+          <button class="btn small" data-act="deploy" data-key="${esc(node.key)}" ${busy ? 'disabled' : ''}>部署</button>` : ''}
         </div>
       </article>`;
   }).join('');
@@ -1116,7 +1127,7 @@ function fmtNum(value) {
 function renderLoadtest(lt) {
   ltCache = lt || { state: 'idle' };
   const state = ltCache.state || 'idle';
-  if (state === 'done' && ltCache.key && ltCache.key !== lastResultsKey) {
+  if (state === 'done' && ltCache.key && ltCache.key !== lastResultsKey && hasPerm('reports')) {
     lastResultsKey = ltCache.key;
     loadResults();
   }
@@ -1232,6 +1243,7 @@ function renderTargets(targets) {
     count.textContent = '0 個';
     return;
   }
+  const writable = canOperate();
   count.textContent = `${latestTargets.length} 個`;
   list.innerHTML = latestTargets.map((t) => {
     const active = t.status === 'approved';
@@ -1256,14 +1268,14 @@ function renderTargets(targets) {
             <span>授權至 <b>${esc(t.authorized_until || '—')}</b></span>
           </div>
         </div>
-        <div class="target-actions">
+        ${writable ? `<div class="target-actions">
           <label class="switch" title="${active ? '已啟用' : '已停用'}">
             <input type="checkbox" data-act="toggle-target" data-key="${esc(t.key)}" ${active ? 'checked' : ''}>
             <span class="slider"></span>
           </label>
           <button class="icon-mini" data-act="edit-target" data-key="${esc(t.key)}" title="編輯">${ICON_EDIT}</button>
           <button class="icon-mini danger" data-act="delete-target" data-key="${esc(t.key)}" title="刪除">${ICON_TRASH}</button>
-        </div>
+        </div>` : ''}
       </article>`;
   }).join('');
 }
@@ -1457,7 +1469,10 @@ targetForm.addEventListener('submit', async (event) => {
 
 let lastResultsKey = null;
 
+let resultsTimer = null;
+
 async function loadResults() {
+  if (!hasPerm('reports')) return;
   try {
     const data = await api('/api/results');
     renderResults(data.items || []);
@@ -1505,11 +1520,104 @@ function renderResults(items) {
 
 /* ---------------------------------------------------------------- 帳號與安全 */
 
+const PERM_META = {
+  status: '壓測狀態與總覽',
+  nodes: '伺服器節點',
+  targets: '壓測目標',
+  reports: '壓測報告',
+  bot: 'Discord 機器人',
+  deploy: '部署終端',
+};
+
+const ALL_PERMS = Object.keys(PERM_META);
+const DEFAULT_PERMS = {
+  admin: [...ALL_PERMS],
+  operator: [...ALL_PERMS],
+  viewer: ['status', 'nodes'],
+};
+
 let latestUsers = [];
 let editingUsername = null;
 
 function roleLabel(role) {
-  return role === 'admin' ? '系統管理員' : '操作員';
+  if (role === 'admin') return '系統管理員';
+  if (role === 'viewer') return '查看者';
+  return '操作員';
+}
+
+function hasPerm(perm) {
+  if (!currentUser) return false;
+  if (currentUser.role === 'admin') return true;
+  return Array.isArray(currentUser.permissions) && currentUser.permissions.includes(perm);
+}
+
+function canOperate() {
+  if (!currentUser) return false;
+  return currentUser.can_operate !== undefined
+    ? Boolean(currentUser.can_operate)
+    : currentUser.role !== 'viewer';
+}
+
+function applyPermissions(user) {
+  const perms = user.role === 'admin' ? ALL_PERMS : (user.permissions || []);
+  const writable = user.can_operate !== undefined ? Boolean(user.can_operate) : user.role !== 'viewer';
+  document.body.dataset.role = user.role || 'operator';
+  document.body.classList.toggle('is-readonly', !writable);
+
+  $$('[data-req-perm]').forEach((el) => {
+    const req = el.dataset.reqPerm;
+    el.classList.toggle('perm-hidden', !perms.includes(req));
+  });
+
+  const hasAnyBiz = perms.length > 0;
+  const overviewNav = $('.nav-item[data-nav="overview"]');
+  if (overviewNav) overviewNav.classList.toggle('perm-hidden', !hasAnyBiz);
+
+  const mainGroup = $('.nav-group-label[data-nav-group="main"]');
+  if (mainGroup) {
+    const showMain = hasAnyBiz || ['nodes', 'targets', 'reports'].some((p) => perms.includes(p));
+    mainGroup.classList.toggle('perm-hidden', !showMain);
+  }
+  const opsGroup = $('.nav-group-label[data-nav-group="ops"]');
+  if (opsGroup) {
+    const showOps = ['bot', 'deploy'].some((p) => perms.includes(p));
+    opsGroup.classList.toggle('perm-hidden', !showOps);
+  }
+
+  const bentoMid = $('#bento-mid');
+  if (bentoMid) {
+    const hasT = perms.includes('targets');
+    const hasR = perms.includes('reports');
+    bentoMid.classList.toggle('perm-hidden', !hasT && !hasR);
+    bentoMid.classList.toggle('single-col', (hasT && !hasR) || (!hasT && hasR));
+  }
+
+  const showTopSummary = perms.includes('status') || perms.includes('nodes');
+  const chipOnline = $('#chip-online');
+  const chipCapacity = $('#chip-capacity');
+  if (chipOnline) chipOnline.classList.toggle('perm-hidden', !showTopSummary);
+  if (chipCapacity) chipCapacity.classList.toggle('perm-hidden', !showTopSummary);
+
+  const profilePerms = $('#profile-perms');
+  if (profilePerms) {
+    if (user.role === 'admin') {
+      profilePerms.innerHTML = '<span class="perm-tag">全部頁面與管理權限</span>';
+    } else if (perms.length) {
+      profilePerms.innerHTML = perms
+        .map((p) => `<span class="perm-tag">${esc(PERM_META[p] || p)}</span>`)
+        .join('');
+    } else {
+      profilePerms.innerHTML = '<span class="perm-tag muted">僅可管理個人帳號</span>';
+    }
+  }
+
+  const curView = $('#workspace').dataset.view || 'overview';
+  const viewPermOk = curView === 'accounts'
+    || (curView === 'overview' && hasAnyBiz)
+    || perms.includes(curView);
+  if (!viewPermOk) {
+    setView(hasAnyBiz ? 'overview' : 'accounts');
+  }
 }
 
 function renderMe(user) {
@@ -1528,7 +1636,7 @@ function renderMe(user) {
 
   const roleBadge = $('#profile-role');
   roleBadge.textContent = roleText;
-  roleBadge.className = 'badge ' + (user.role === 'admin' ? 'ok' : '');
+  roleBadge.className = 'badge ' + (user.role === 'admin' ? 'ok' : user.role === 'viewer' ? 'viewer' : '');
 
   const lastLogin = user.last_login_at
     ? `${user.last_login_at.replace('T', ' ')}${user.last_login_ip ? ' · ' + user.last_login_ip : ''}`
@@ -1541,6 +1649,7 @@ function renderMe(user) {
   }
 
   $('#admin-users-panel').classList.toggle('hidden', user.role !== 'admin');
+  applyPermissions(user);
 }
 
 $('#user-pill').addEventListener('click', () => setView('accounts'));
@@ -1634,7 +1743,9 @@ function renderUsers(items) {
     const isSelf = currentUser && u.username === currentUser.username;
     const roleBadge = u.role === 'admin'
       ? '<span class="badge ok">系統管理員</span>'
-      : '<span class="badge">操作員</span>';
+      : u.role === 'viewer'
+        ? '<span class="badge viewer">查看者</span>'
+        : '<span class="badge">操作員</span>';
     const stateBadge = u.enabled
       ? '<span class="badge ok">啟用中</span>'
       : '<span class="badge err">已停用</span>';
@@ -1642,6 +1753,13 @@ function renderUsers(items) {
     const lastLogin = u.last_login_at
       ? `${esc(u.last_login_at.replace('T', ' '))}${u.last_login_ip ? ' (' + esc(u.last_login_ip) + ')' : ''}`
       : '尚未登入';
+
+    const perms = Array.isArray(u.permissions) ? u.permissions : [];
+    const permTags = u.role === 'admin'
+      ? '<span class="perm-tag">全部頁面與管理權限</span>'
+      : (perms.length
+        ? perms.map((p) => `<span class="perm-tag">${esc(PERM_META[p] || p)}</span>`).join('')
+        : '<span class="perm-tag muted">無業務頁面權限</span>');
 
     return `
       <article class="user-row ${u.enabled ? '' : 'off'}">
@@ -1658,6 +1776,7 @@ function renderUsers(items) {
             <span>建立 <b>${esc((u.created_at || '—').replace('T', ' '))}</b></span>
             <span>最近登入 <b>${lastLogin}</b></span>
           </div>
+          <div class="perm-tags">${permTags}</div>
         </div>
         <div class="user-row-actions">
           <label class="switch" title="${u.enabled ? '已啟用' : '已停用'}">
@@ -1673,6 +1792,49 @@ function renderUsers(items) {
 }
 
 const userForm = $('#user-form');
+
+function getModalPerms() {
+  return $$('#user-perm-grid input[name="perm"]:checked').map((el) => el.value);
+}
+
+function setModalPerms(perms, locked) {
+  const set = new Set(perms || []);
+  $$('#user-perm-grid input[name="perm"]').forEach((el) => {
+    el.checked = set.has(el.value);
+    el.disabled = Boolean(locked);
+  });
+}
+
+function syncPermUiForRole(role, applyDefault) {
+  const isAdmin = role === 'admin';
+  if (isAdmin) {
+    setModalPerms(ALL_PERMS, true);
+  } else if (applyDefault) {
+    setModalPerms(DEFAULT_PERMS[role] || ['status'], false);
+  } else {
+    setModalPerms(getModalPerms(), false);
+  }
+  $('#btn-perm-viewer').disabled = isAdmin;
+  $('#btn-perm-all').disabled = isAdmin;
+  $('#perm-role-hint').textContent = isAdmin
+    ? '系統管理員預設擁有全部頁面與操作權限。'
+    : role === 'viewer'
+      ? '查看者僅能檢視以上勾選頁面，所有修改、部署與控制按鈕均會隱藏並於後端封鎖。'
+      : '操作員可在以上勾選頁面執行新增、編輯與啟動等操作。';
+}
+
+userForm.role.addEventListener('change', () => {
+  const role = userForm.role.value;
+  const applyDefault = !editingUsername || role === 'admin';
+  syncPermUiForRole(role, applyDefault);
+});
+
+$('#btn-perm-viewer').addEventListener('click', () => {
+  setModalPerms(DEFAULT_PERMS.viewer, userForm.role.value === 'admin');
+});
+$('#btn-perm-all').addEventListener('click', () => {
+  setModalPerms(ALL_PERMS, userForm.role.value === 'admin');
+});
 
 $('#btn-add-user').addEventListener('click', () => openUserModal(null));
 $('#user-modal-close').addEventListener('click', closeUserModal);
@@ -1708,7 +1870,7 @@ $('#btn-gen-password').addEventListener('click', async () => {
 function openUserModal(username) {
   editingUsername = username;
   userForm.reset();
-  userForm.role.value = 'operator';
+  userForm.role.value = 'viewer';
   userForm.enabled.checked = true;
   userForm.username.readOnly = Boolean(username);
   const pwdInput = $('#user-modal-password');
@@ -1727,7 +1889,13 @@ function openUserModal(username) {
       userForm.display_name.value = target.display_name || '';
       userForm.role.value = target.role || 'operator';
       userForm.enabled.checked = Boolean(target.enabled);
+      setModalPerms(target.permissions || DEFAULT_PERMS[userForm.role.value], target.role === 'admin');
+      syncPermUiForRole(userForm.role.value, false);
+    } else {
+      syncPermUiForRole(userForm.role.value, true);
     }
+  } else {
+    syncPermUiForRole('viewer', true);
   }
   $('#user-modal').classList.remove('hidden');
   setTimeout(() => (username ? userForm.display_name : userForm.username).focus(), 50);
@@ -1746,6 +1914,7 @@ userForm.addEventListener('submit', async (event) => {
   const role = userForm.role.value;
   const password = userForm.password.value;
   const enabled = userForm.enabled.checked;
+  const permissions = getModalPerms();
 
   if (!editingUsername && password.length < 8) {
     setInlineStatus('#user-form-status', '密碼長度至少需要 8 個字元', 'err');
@@ -1764,6 +1933,7 @@ userForm.addEventListener('submit', async (event) => {
         display_name: displayName,
         role,
         enabled,
+        permissions,
       };
       if (password) payload.new_password = password;
       await api(`/api/users/${encodeURIComponent(editingUsername)}`, {
@@ -1780,6 +1950,7 @@ userForm.addEventListener('submit', async (event) => {
           role,
           password,
           enabled,
+          permissions,
         }),
       });
       toast(`已建立帳號 @${username}`, 'ok');
@@ -1868,8 +2039,9 @@ async function boot() {
     if (stateTimer) clearInterval(stateTimer);
     stateTimer = setInterval(refreshState, 5000);
     loadResults();
-    setInterval(loadResults, 30000);
-    if (location.hash === '#add') openNodeModal(null);
+    if (resultsTimer) clearInterval(resultsTimer);
+    resultsTimer = setInterval(loadResults, 30000);
+    if (location.hash === '#add' && canOperate()) openNodeModal(null);
   } catch (err) {
     if (err.message !== 'unauth') console.warn('[boot]', err.message);
   }

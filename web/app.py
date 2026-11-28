@@ -112,10 +112,64 @@ WEB_TOKEN = load_token()
 
 PBKDF2_ITERATIONS = 310_000
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,31}$")
-VALID_ROLES = ("admin", "operator")
+VALID_ROLES = ("admin", "operator", "viewer")
+ALL_PERMISSIONS = ("status", "nodes", "targets", "reports", "bot", "deploy")
+DEFAULT_PERMISSIONS = {
+    "admin": list(ALL_PERMISSIONS),
+    "operator": list(ALL_PERMISSIONS),
+    "viewer": ["status", "nodes"],
+}
 SESSION_TTL_DEFAULT = 60 * 60 * 12
 SESSION_TTL_REMEMBER = 60 * 60 * 24 * 7
 _LOGIN_FAILS: dict[str, deque[float]] = {}
+
+
+def normalize_permissions(role: str, raw: Optional[list[str]]) -> list[str]:
+    if role == "admin":
+        return list(ALL_PERMISSIONS)
+    if raw is None:
+        return list(DEFAULT_PERMISSIONS.get(role, ["status"]))
+    allowed = set(str(p).strip() for p in raw)
+    return [p for p in ALL_PERMISSIONS if p in allowed]
+
+
+def effective_permissions(rec: dict) -> list[str]:
+    return normalize_permissions(rec.get("role", "operator"), rec.get("permissions"))
+
+
+def has_perm(user: dict, perm: str, write: bool = False) -> bool:
+    role = user.get("role", "operator")
+    if role == "admin":
+        return True
+    if write and role == "viewer":
+        return False
+    return perm in effective_permissions(user)
+
+
+def require_perm(perm: str, write: bool = False):
+    def _dep(request: Request) -> dict:
+        user = require_auth(request)
+        if not has_perm(user, perm, write=write):
+            detail = (
+                "權限不足，查看者無法執行操作"
+                if write and user.get("role") == "viewer"
+                else "權限不足，無法存取此功能"
+            )
+            raise HTTPException(status_code=403, detail=detail)
+        return user
+    return _dep
+
+
+def _bot_public_for_user(bot_data: dict, user: dict) -> dict:
+    if user.get("role") == "viewer":
+        return {
+            "service": bot_data.get("service", "inactive"),
+            "configured": bool(bot_data.get("configured", False)),
+            "commands": bot_data.get("commands", []),
+            "log": bot_data.get("log", ""),
+            "readonly": True,
+        }
+    return {**bot_data, "readonly": False}
 
 
 def hash_password(password: str) -> str:
@@ -181,11 +235,14 @@ def save_users(data: dict) -> None:
 
 
 def _user_public(username: str, rec: dict) -> dict:
+    role = rec.get("role", "operator")
     return {
         "username": username,
         "display_name": rec.get("display_name") or username,
-        "role": rec.get("role", "operator"),
+        "role": role,
         "enabled": bool(rec.get("enabled", True)),
+        "permissions": effective_permissions(rec),
+        "can_operate": role in ("admin", "operator"),
         "created_at": rec.get("created_at", ""),
         "updated_at": rec.get("updated_at", ""),
         "last_login_at": rec.get("last_login_at", ""),
@@ -219,6 +276,7 @@ def _seed_admin_from_env() -> None:
         "display_name": "系統管理員",
         "role": "admin",
         "enabled": True,
+        "permissions": list(ALL_PERMISSIONS),
         "password_hash": hash_password(env_pass),
         "token_version": 1,
         "created_at": now,
@@ -1251,6 +1309,7 @@ class UserCreateBody(BaseModel):
     password: str
     role: str = "operator"
     enabled: bool = True
+    permissions: Optional[list[str]] = None
 
 
 class UserUpdateBody(BaseModel):
@@ -1258,6 +1317,7 @@ class UserUpdateBody(BaseModel):
     role: Optional[str] = None
     enabled: Optional[bool] = None
     new_password: Optional[str] = None
+    permissions: Optional[list[str]] = None
 
 
 class DeployBody(BaseModel):
@@ -1401,6 +1461,7 @@ async def setup_admin(body: SetupBody, request: Request):
         "display_name": display_name,
         "role": "admin",
         "enabled": True,
+        "permissions": list(ALL_PERMISSIONS),
         "password_hash": hash_password(password),
         "token_version": 1,
         "created_at": now,
@@ -1547,18 +1608,20 @@ async def create_user(
     password = validate_password(body.password)
     role = (body.role or "operator").strip().lower()
     if role not in VALID_ROLES:
-        raise HTTPException(status_code=400, detail="角色僅支援 admin 或 operator")
+        raise HTTPException(status_code=400, detail="角色僅支援 admin、operator 或 viewer")
 
     store = load_users()
     users = store.setdefault("users", {})
     if username in users:
         raise HTTPException(status_code=409, detail=f"帳號 {username} 已存在")
 
+    perms = normalize_permissions(role, body.permissions)
     now = datetime.now().isoformat(timespec="seconds")
     rec = {
         "display_name": (body.display_name or "").strip()[:40] or username,
         "role": role,
         "enabled": bool(body.enabled),
+        "permissions": perms,
         "password_hash": hash_password(password),
         "token_version": 1,
         "created_at": now,
@@ -1568,7 +1631,8 @@ async def create_user(
     }
     users[username] = rec
     save_users(store)
-    audit("USER-ADD", _client_ip(request), f"by={admin['username']} target={username} role={role}")
+    audit("USER-ADD", _client_ip(request),
+          f"by={admin['username']} target={username} role={role} perms={','.join(perms)}")
     return {"ok": True, "user": _user_public(username, rec)}
 
 
@@ -1586,11 +1650,12 @@ async def update_user(
     if not rec:
         raise HTTPException(status_code=404, detail="找不到此帳號")
 
-    new_role = rec.get("role", "operator")
+    old_role = rec.get("role", "operator")
+    new_role = old_role
     if body.role is not None:
         candidate = body.role.strip().lower()
         if candidate not in VALID_ROLES:
-            raise HTTPException(status_code=400, detail="角色僅支援 admin 或 operator")
+            raise HTTPException(status_code=400, detail="角色僅支援 admin、operator 或 viewer")
         new_role = candidate
 
     new_enabled = bool(rec.get("enabled", True)) if body.enabled is None else bool(body.enabled)
@@ -1598,7 +1663,7 @@ async def update_user(
     if target_name == admin["username"] and not new_enabled:
         raise HTTPException(status_code=400, detail="不可停用目前登入中的自己的帳號")
 
-    was_enabled_admin = rec.get("role") == "admin" and rec.get("enabled", True)
+    was_enabled_admin = old_role == "admin" and rec.get("enabled", True)
     will_be_enabled_admin = new_role == "admin" and new_enabled
     if was_enabled_admin and not will_be_enabled_admin and _count_enabled_admins(users) <= 1:
         raise HTTPException(status_code=400, detail="必須至少保留一位啟用中的系統管理員")
@@ -1607,6 +1672,15 @@ async def update_user(
         rec["display_name"] = body.display_name.strip()[:40] or target_name
     rec["role"] = new_role
     rec["enabled"] = new_enabled
+
+    if new_role == "admin":
+        rec["permissions"] = list(ALL_PERMISSIONS)
+    elif body.permissions is not None:
+        rec["permissions"] = normalize_permissions(new_role, body.permissions)
+    elif new_role != old_role:
+        rec["permissions"] = list(DEFAULT_PERMISSIONS.get(new_role, ["status"]))
+    else:
+        rec["permissions"] = effective_permissions(rec)
 
     bump_ver = False
     if not new_enabled:
@@ -1620,7 +1694,8 @@ async def update_user(
     rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
     save_users(store)
     audit("USER-EDIT", _client_ip(request),
-          f"by={admin['username']} target={target_name} role={new_role} enabled={new_enabled}")
+          f"by={admin['username']} target={target_name} role={new_role} enabled={new_enabled} "
+          f"perms={','.join(rec['permissions'])}")
 
     response = JSONResponse({"ok": True, "user": _user_public(target_name, rec)})
     if target_name == admin["username"] and bump_ver and new_enabled:
@@ -1676,6 +1751,13 @@ async def delete_user(
 
 @app.get("/api/state")
 async def get_state(user: dict = Depends(require_auth)):
+    can_status = has_perm(user, "status")
+    can_nodes = has_perm(user, "nodes")
+    can_targets = has_perm(user, "targets")
+    can_bot = has_perm(user, "bot")
+    can_deploy = has_perm(user, "deploy")
+    is_viewer = user.get("role") == "viewer"
+
     config = load_config()
     nodes_cfg = config.get("nodes", {})
     creds = load_creds()
@@ -1684,68 +1766,76 @@ async def get_state(user: dict = Depends(require_auth)):
     online = 0
     enabled_capacity = []
 
-    for key, cfg in nodes_cfg.items():
-        st = state_of(key)
-        if st.online:
-            online += 1
-        if cfg.get("enabled", True):
-            enabled_capacity.append(int(cfg.get("max_threads", 0)))
-        items.append({
-            "key": key,
-            "host": cfg.get("host", ""),
-            "port": int(cfg.get("port", 1099)),
-            "ssh_port": int(cfg.get("ssh_port", 22)),
-            "ssh_user": cfg.get("ssh_user", SSH_USER),
-            "has_password": key in creds,
-            "region": cfg.get("region", "—"),
-            "max_threads": int(cfg.get("max_threads", 0)),
-            "enabled": bool(cfg.get("enabled", True)),
-            "note": cfg.get("note", ""),
-            "source": cfg.get("source", ""),
-            "expires_at": cfg.get("expires_at"),
-            "batch_id": cfg.get("batch_id", ""),
-            "online": st.online,
-            "latency_ms": st.latency,
-            "ssh_ok": st.ssh_ok,
-            "checked_ago": round(now - st.checked, 1) if st.checked else None,
-            "history": [h for h in st.history],
-        })
+    if can_nodes or can_status:
+        for key, cfg in nodes_cfg.items():
+            st = state_of(key)
+            if st.online:
+                online += 1
+            if cfg.get("enabled", True):
+                enabled_capacity.append(int(cfg.get("max_threads", 0)))
+            if can_nodes:
+                items.append({
+                    "key": key,
+                    "host": cfg.get("host", ""),
+                    "port": int(cfg.get("port", 1099)),
+                    "ssh_port": int(cfg.get("ssh_port", 22)),
+                    "ssh_user": "" if is_viewer else cfg.get("ssh_user", SSH_USER),
+                    "has_password": False if is_viewer else (key in creds),
+                    "region": cfg.get("region", "—"),
+                    "max_threads": int(cfg.get("max_threads", 0)),
+                    "enabled": bool(cfg.get("enabled", True)),
+                    "note": cfg.get("note", ""),
+                    "source": cfg.get("source", ""),
+                    "expires_at": cfg.get("expires_at"),
+                    "batch_id": cfg.get("batch_id", ""),
+                    "online": st.online,
+                    "latency_ms": st.latency,
+                    "ssh_ok": None if is_viewer else st.ssh_ok,
+                    "checked_ago": round(now - st.checked, 1) if st.checked else None,
+                    "history": [h for h in st.history],
+                })
 
     # 有效容量 = min(啟用節點上限) × 啟用節點數（JMeter 每節點跑相同執行緒數）
     capacity = min(enabled_capacity) * len(enabled_capacity) if enabled_capacity else 0
-    job = CURRENT["job"] or CURRENT["last"]
+    job = (CURRENT["job"] or CURRENT["last"]) if can_deploy else None
     version = await asyncio.to_thread(jmeter_version)
+    bot_data = _bot_public_for_user(await asyncio.to_thread(bot_status), user) if can_bot else None
 
     return {
         "server": {
             "hostname": socket.gethostname(),
             "master_ip": MASTER_IP,
             "jmeter": version,
-            "ssh": bool(shutil.which("ssh")),
+            "ssh": False if is_viewer else bool(shutil.which("ssh")),
             "time": datetime.now().isoformat(timespec="seconds"),
         },
         "summary": {
-            "total": len(items),
+            "total": len(nodes_cfg) if (can_nodes or can_status) else 0,
             "enabled": len(enabled_capacity),
             "online": online,
-            "offline": [i["key"] for i in items if not i["online"]],
+            "offline": [k for k, _v in nodes_cfg.items() if not state_of(k).online] if (can_nodes or can_status) else [],
             "capacity": capacity,
         },
         "nodes": items,
         "targets": [
             _target_view(k, v)
             for k, v in load_targets().get("targets", {}).items()
-        ],
+        ] if can_targets else [],
         "job": job.summary() if job else None,
-        "bot": await asyncio.to_thread(bot_status),
-        "loadtest": await asyncio.to_thread(loadtest_status),
+        "bot": bot_data,
+        "loadtest": await asyncio.to_thread(loadtest_status) if can_status else None,
         "me": _user_public(user["username"], user),
         "users_count": len(load_users().get("users", {})) if user.get("role") == "admin" else None,
     }
 
 
 @app.post("/api/nodes/{key}/enabled")
-async def toggle_node(key: str, body: ToggleBody, request: Request, _=Depends(require_auth)):
+async def toggle_node(
+    key: str,
+    body: ToggleBody,
+    request: Request,
+    _=Depends(require_perm("nodes", write=True)),
+):
     config = load_config()
     nodes = config.get("nodes", {})
     if key not in nodes:
@@ -1770,7 +1860,11 @@ def _node_entry(data: dict) -> dict:
 
 
 @app.post("/api/nodes")
-async def create_node(body: NodeBody, request: Request, _=Depends(require_auth)):
+async def create_node(
+    body: NodeBody,
+    request: Request,
+    _=Depends(require_perm("nodes", write=True)),
+):
     data = validate_node(body)
     config = load_config()
     nodes = config.setdefault("nodes", {})
@@ -1788,7 +1882,12 @@ async def create_node(body: NodeBody, request: Request, _=Depends(require_auth))
 
 
 @app.put("/api/nodes/{key}")
-async def update_node(key: str, body: NodeBody, request: Request, _=Depends(require_auth)):
+async def update_node(
+    key: str,
+    body: NodeBody,
+    request: Request,
+    _=Depends(require_perm("nodes", write=True)),
+):
     data = validate_node(body)
     config = load_config()
     nodes = config.get("nodes", {})
@@ -1825,7 +1924,11 @@ async def update_node(key: str, body: NodeBody, request: Request, _=Depends(requ
 
 
 @app.delete("/api/nodes/{key}")
-async def delete_node(key: str, request: Request, _=Depends(require_auth)):
+async def delete_node(
+    key: str,
+    request: Request,
+    _=Depends(require_perm("nodes", write=True)),
+):
     config = load_config()
     nodes = config.get("nodes", {})
     if key not in nodes:
@@ -1986,7 +2089,7 @@ def _plan_info(name: str) -> dict:
 
 
 @app.get("/api/targets")
-async def list_targets_api(_=Depends(require_auth)):
+async def list_targets_api(_=Depends(require_perm("targets", write=False))):
     data = load_targets()
     items = [_target_view(k, v) for k, v in data.get("targets", {}).items()]
     items.sort(key=lambda x: x["key"])
@@ -1995,7 +2098,11 @@ async def list_targets_api(_=Depends(require_auth)):
 
 
 @app.post("/api/targets")
-async def create_target(body: TargetBody, request: Request, _=Depends(require_auth)):
+async def create_target(
+    body: TargetBody,
+    request: Request,
+    _=Depends(require_perm("targets", write=True)),
+):
     data = validate_target(body)
     store = load_targets()
     targets = store.setdefault("targets", {})
@@ -2021,7 +2128,12 @@ async def create_target(body: TargetBody, request: Request, _=Depends(require_au
 
 
 @app.put("/api/targets/{key}")
-async def update_target(key: str, body: TargetBody, request: Request, _=Depends(require_auth)):
+async def update_target(
+    key: str,
+    body: TargetBody,
+    request: Request,
+    _=Depends(require_perm("targets", write=True)),
+):
     data = validate_target(body)
     store = load_targets()
     targets = store.get("targets", {})
@@ -2060,7 +2172,11 @@ async def update_target(key: str, body: TargetBody, request: Request, _=Depends(
 
 
 @app.delete("/api/targets/{key}")
-async def delete_target(key: str, request: Request, _=Depends(require_auth)):
+async def delete_target(
+    key: str,
+    request: Request,
+    _=Depends(require_perm("targets", write=True)),
+):
     store = load_targets()
     targets = store.get("targets", {})
     if key not in targets:
@@ -2291,7 +2407,7 @@ async def join_hook(body: JoinBody, request: Request):
 
 
 @app.post("/api/probe")
-async def probe_target(body: ProbeBody, _=Depends(require_auth)):
+async def probe_target(body: ProbeBody, _=Depends(require_perm("nodes", write=True))):
     host = body.host.strip()
     if not HOST_RE.match(host):
         raise HTTPException(status_code=400, detail="主機格式不正確")
@@ -2374,7 +2490,7 @@ def _ssh_probe_blocking(host: str, port: int, user: str, password: str) -> dict:
 
 
 @app.post("/api/ssh-test")
-async def ssh_test(body: SshTestBody, _=Depends(require_auth)):
+async def ssh_test(body: SshTestBody, _=Depends(require_perm("nodes", write=True))):
     host = body.host.strip()
     if not HOST_RE.match(host):
         raise HTTPException(status_code=400, detail="主機格式不正確")
@@ -2409,12 +2525,16 @@ class BotActionBody(BaseModel):
 
 
 @app.get("/api/bot/status")
-async def get_bot_status(_=Depends(require_auth)):
-    return await asyncio.to_thread(bot_status)
+async def get_bot_status(user: dict = Depends(require_perm("bot", write=False))):
+    return _bot_public_for_user(await asyncio.to_thread(bot_status), user)
 
 
 @app.post("/api/bot/config")
-async def save_bot_config(body: BotConfigBody, request: Request, _=Depends(require_auth)):
+async def save_bot_config(
+    body: BotConfigBody,
+    request: Request,
+    _=Depends(require_perm("bot", write=True)),
+):
     owner = body.owner_id.strip()
     guild = body.guild_id.strip()
     if owner and not owner.isdigit():
@@ -2473,7 +2593,7 @@ class BotTokenBody(BaseModel):
 
 
 @app.post("/api/bot/test-token")
-async def test_bot_token(body: BotTokenBody, _=Depends(require_auth)):
+async def test_bot_token(body: BotTokenBody, _=Depends(require_perm("bot", write=True))):
     token = (body.token or "").strip()
     if not token:
         token = (await asyncio.to_thread(read_env)).get("DISCORD_TOKEN", "").strip()
@@ -2483,7 +2603,7 @@ async def test_bot_token(body: BotTokenBody, _=Depends(require_auth)):
 
 
 @app.post("/api/bot/clear-log")
-async def clear_bot_log(_=Depends(require_auth)):
+async def clear_bot_log(_=Depends(require_perm("bot", write=True))):
     try:
         BOT_LOG.parent.mkdir(parents=True, exist_ok=True)
         BOT_LOG.write_text("", encoding="utf-8")
@@ -2493,7 +2613,11 @@ async def clear_bot_log(_=Depends(require_auth)):
 
 
 @app.post("/api/bot/action")
-async def bot_action(body: BotActionBody, request: Request, _=Depends(require_auth)):
+async def bot_action(
+    body: BotActionBody,
+    request: Request,
+    _=Depends(require_perm("bot", write=True)),
+):
     action = body.action
     if action not in ("start", "stop", "restart"):
         raise HTTPException(status_code=400, detail="action 只能是 start / stop / restart")
@@ -2521,7 +2645,7 @@ async def bot_action(body: BotActionBody, request: Request, _=Depends(require_au
 
 
 @app.get("/api/loadtest")
-async def get_loadtest(_=Depends(require_auth)):
+async def get_loadtest(_=Depends(require_perm("status", write=False))):
     return await asyncio.to_thread(loadtest_status)
 
 
@@ -2540,13 +2664,17 @@ def _result_path(stem: str) -> Path:
 
 
 @app.get("/api/results")
-async def list_results_api(_=Depends(require_auth)):
+async def list_results_api(_=Depends(require_perm("reports", write=False))):
     items = await asyncio.to_thread(report_mod.list_results, RESULTS_DIR, 30)
     return {"items": items}
 
 
 @app.get("/api/results/{stem}/report")
-async def download_report(stem: str, format: str = "html", _=Depends(require_auth)):
+async def download_report(
+    stem: str,
+    format: str = "html",
+    _=Depends(require_perm("reports", write=False)),
+):
     path = _result_path(stem)
     if format == "md":
         body = await asyncio.to_thread(report_mod.render_markdown, path)
@@ -2564,7 +2692,11 @@ async def download_report(stem: str, format: str = "html", _=Depends(require_aut
 
 
 @app.get("/api/results/{stem}/raw")
-async def download_raw(stem: str, kind: str = "jtl", _=Depends(require_auth)):
+async def download_raw(
+    stem: str,
+    kind: str = "jtl",
+    _=Depends(require_perm("reports", write=False)),
+):
     path = _result_path(stem)
     target = path if kind != "log" else RESULTS_DIR / f"{stem}-jmeter.log"
     if not target.exists():
@@ -2573,7 +2705,7 @@ async def download_raw(stem: str, kind: str = "jtl", _=Depends(require_auth)):
 
 
 @app.get("/api/nodes/{key}/inspect")
-async def inspect_node(key: str, _=Depends(require_auth)):
+async def inspect_node(key: str, _=Depends(require_perm("nodes", write=True))):
     cfg = load_config().get("nodes", {}).get(key)
     if not cfg:
         raise HTTPException(status_code=404, detail="節點不存在")
@@ -2604,7 +2736,11 @@ async def inspect_node(key: str, _=Depends(require_auth)):
 
 
 @app.post("/api/deploy")
-async def start_deploy(body: DeployBody, request: Request, _=Depends(require_auth)):
+async def start_deploy(
+    body: DeployBody,
+    request: Request,
+    _=Depends(require_perm("deploy", write=True)),
+):
     if CURRENT["job"] is not None:
         raise HTTPException(status_code=409, detail="已有部署任務在執行中")
 
@@ -2638,7 +2774,7 @@ async def start_deploy(body: DeployBody, request: Request, _=Depends(require_aut
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str, _=Depends(require_auth)):
+async def get_job(job_id: str, _=Depends(require_perm("deploy", write=False))):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任務不存在")
@@ -2646,7 +2782,7 @@ async def get_job(job_id: str, _=Depends(require_auth)):
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str, _=Depends(require_auth)):
+async def cancel_job(job_id: str, _=Depends(require_perm("deploy", write=True))):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任務不存在")
@@ -2664,8 +2800,11 @@ async def cancel_job(job_id: str, _=Depends(require_auth)):
 
 @app.get("/api/jobs/{job_id}/stream")
 async def stream_job(job_id: str, request: Request):
-    if not is_authed(request):
+    user = current_user(request)
+    if not user:
         raise HTTPException(status_code=401, detail="未登入")
+    if not has_perm(user, "deploy", write=False):
+        raise HTTPException(status_code=403, detail="沒有部署終端檢視權限")
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="任務不存在")
