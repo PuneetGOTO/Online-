@@ -41,12 +41,45 @@ c_ok "Python $(python3 -V 2>&1 | awk '{print $2}') / Java $(java -version 2>&1 |
 # ---------------------------------------------------------------- 2. JMeter（master 端作為 client）
 if [ ! -x "${JMETER_HOME}/bin/jmeter" ]; then
   c_info "安裝 JMeter ${JMETER_VER}（master 與節點版本必須一致）"
-  curl -fsSL -o /tmp/jmeter.tgz \
+  # archive.apache.org 在部分區域只有 50~60 KB/s，85 MB 要下載半小時以上。
+  # 依序嘗試三個鏡像，任何一個成功就停。
+  TMP_TGZ="$(mktemp /tmp/jmeter-XXXXXX.tgz)"
+  MIRRORS=(
+    "https://dlcdn.apache.org/jmeter/binaries/apache-jmeter-${JMETER_VER}.tgz"
+    "https://mirrors.tuna.tsinghua.edu.cn/apache/jmeter/binaries/apache-jmeter-${JMETER_VER}.tgz"
     "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VER}.tgz"
-  tar -xzf /tmp/jmeter.tgz -C /opt
+  )
+  DOWNLOADED=0
+  for url in "${MIRRORS[@]}"; do
+    c_info "下載 ${url#https://}（約 85 MB）"
+    : > "${TMP_TGZ}"
+    curl -fsSL --connect-timeout 10 --max-time 900 --retry 2 --retry-delay 2 \
+      -o "${TMP_TGZ}" "${url}" &
+    CURL_PID=$!
+    while kill -0 "${CURL_PID}" 2>/dev/null; do
+      sleep 5
+      kill -0 "${CURL_PID}" 2>/dev/null || break
+      printf '      已下載 %s\n' "$(du -h "${TMP_TGZ}" 2>/dev/null | cut -f1)"
+    done
+    wait "${CURL_PID}" 2>/dev/null || true
+
+    if tar -tzf "${TMP_TGZ}" >/dev/null 2>&1; then
+      c_ok "下載完成（$(du -h "${TMP_TGZ}" | cut -f1)）"
+      DOWNLOADED=1
+      break
+    fi
+    c_warn "此鏡像不可用，換下一個"
+  done
+  if [ "${DOWNLOADED}" -ne 1 ]; then
+    c_err "三個鏡像都下載失敗，請手動安裝 JMeter ${JMETER_VER} 到 ${JMETER_HOME}"
+    rm -f "${TMP_TGZ}"
+    exit 1
+  fi
+  tar -xzf "${TMP_TGZ}" -C /opt
   rm -rf "${JMETER_HOME}"
   mv "/opt/apache-jmeter-${JMETER_VER}" "${JMETER_HOME}"
-  rm -f /tmp/jmeter.tgz
+  rm -f "${TMP_TGZ}"
+  c_ok "JMeter 已安裝到 ${JMETER_HOME}"
 else
   c_ok "JMeter 已存在，跳過安裝"
 fi
