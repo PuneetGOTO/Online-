@@ -777,6 +777,95 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 
 ---
 
+## 與開服機器人對接（開服即自動接節點）
+
+另一個負責「華為雲按需開服」的機器人可以在機器開好之後通知本平台，本平台會自動
+SSH 進去部署成壓測節點，不需要人工介入。整條鏈路是：
+
+```
+開服機器人 /open server
+   └─ 建立 ECS（含定時自動銷毀）
+        └─ POST {平台}/api/hooks/ecs   ← 帶 IP、SSH 帳密、到期時間
+             └─ 本平台登記節點 + 背景 SSH 部署 JMeter Server
+                  └─ 節點上線，/start 立即可用
+                       └─ ECS 到期被銷毀 → 節點自動從清單移除
+```
+
+### 設定
+
+平台端在 `.env` 加一組專用權杖（與網頁登入的 `WEB_TOKEN` 分開，外流時可單獨更換）：
+
+```
+HOOK_TOKEN=<隨機字串>
+```
+
+開服機器人端：
+
+```
+LOADTEST_HOOK_URL=http://<平台位址>:8080
+LOADTEST_HOOK_TOKEN=<與上面相同>
+LOADTEST_MAX_THREADS=600
+```
+
+留空即停用，開服流程不受影響。
+
+### 呼叫格式
+
+```http
+POST /api/hooks/ecs
+X-LT-Token: <HOOK_TOKEN>
+Content-Type: application/json
+
+{
+  "batch_id": "ab12cd34",
+  "servers": [
+    {
+      "name": "bot-ab12cd34-1",
+      "host": "203.0.113.10",
+      "ssh_user": "root",
+      "ssh_password": "******",
+      "ssh_port": 22,
+      "max_threads": 600,
+      "expires_at": "2026-11-28T15:00:00+00:00"
+    }
+  ]
+}
+```
+
+回應 `{"ok": true, "accepted": ["..."], "skipped": []}`，部署在背景進行，不阻塞呼叫端。
+
+### 另一種接入：節點自註冊
+
+若不想改動開服機器人，也可以在它的「預置腳本」欄位填一行，讓新機器自己安裝並回報：
+
+```bash
+curl -fsSL "http://<平台位址>:8080/api/hooks/ecs/node.sh?token=<HOOK_TOKEN>" | bash
+```
+
+腳本會安裝 Java 與 JMeter、設定 RMI 回傳位址、建立 `jmeter-server` 系統服務，
+最後呼叫 `/api/hooks/join` 登記自己。適合用在開服機器人只負責開機、不負責部署的情況。
+
+### 自動清理
+
+雲端節點（`source` 為 `ecs` 或 `join`）會在下列情況自動從清單移除，並寫入 `AUTO-DEL` 稽核：
+
+| 條件 | 說明 |
+|---|---|
+| 超過 `expires_at` 再加 10 分鐘 | 對應開服機器人的定時銷毀 |
+| 連續離線超過 20 分鐘 | 機器已被刪除或失聯 |
+
+手動新增的節點不受影響。
+
+### 網路前置條件
+
+新機器要能被平台連上，雲端安全組需放行：
+
+| 埠 | 來源 | 用途 |
+|---|---|---|
+| 22 | 平台 IP | SSH 部署 |
+| 1099 | 平台 IP | JMeter RMI 控制 |
+| 4000-4010 | 平台 IP | RMI 回傳通道 |
+
 ## 指令一覽
 
 | 指令 | 權限 | 說明 |

@@ -25,7 +25,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -80,6 +80,10 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+# 給「開服機器人」呼叫用的共用權杖；與 WEB_TOKEN 分開，外流時可單獨更換。
+# 必須在 _load_dotenv() 之後讀取，否則從 .env 拿不到值。
+HOOK_TOKEN = os.getenv("HOOK_TOKEN", "").strip()
 
 
 def load_token() -> str:
@@ -906,19 +910,83 @@ async def run_deploy(job: Job, keys: list[str], master_ip: str) -> None:
 
 # ---------------------------------------------------------------- 生命週期
 
+OFFLINE_SINCE: dict[str, float] = {}
+AUTO_OFFLINE_GRACE = 20 * 60    # 雲端節點離線超過 20 分鐘視為已被銷毀
+AUTO_EXPIRY_GRACE = 10 * 60     # 到期後再寬限 10 分鐘
+
+
+def _parse_ts(text: str) -> Optional[float]:
+    if not text:
+        return None
+    try:
+        raw = text.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+async def cleanup_loop() -> None:
+    """移除已銷毀或到期的雲端節點，避免清單殘留離線機器。"""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            config = load_config()
+            nodes = config.get("nodes", {})
+            now = time.time()
+            removed: list[tuple[str, str]] = []
+
+            for key, cfg in list(nodes.items()):
+                if cfg.get("source") not in ("ecs", "join"):
+                    continue
+                st = STATE.get(key)
+                online = bool(st and st.online)
+
+                if online:
+                    OFFLINE_SINCE.pop(key, None)
+                else:
+                    OFFLINE_SINCE.setdefault(key, now)
+
+                expired = False
+                ts = _parse_ts(cfg.get("expires_at") or "")
+                if ts is not None and now > ts + AUTO_EXPIRY_GRACE:
+                    expired = True
+                gone = (now - OFFLINE_SINCE.get(key, now)) > AUTO_OFFLINE_GRACE
+
+                if expired or gone:
+                    reason = "已到期" if expired else "長時間離線"
+                    nodes.pop(key, None)
+                    STATE.pop(key, None)
+                    OFFLINE_SINCE.pop(key, None)
+                    drop_cred(key)
+                    removed.append((key, reason))
+
+            if removed:
+                save_config(config)
+                for key, reason in removed:
+                    audit("AUTO-DEL", "-", f"{key} {reason}")
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     task = asyncio.create_task(monitor_loop())
+    cleaner = asyncio.create_task(cleanup_loop())
     print(f"[web] 主服務器 IP {MASTER_IP} · 監控 {PROBE_INTERVAL}s 間隔")
     try:
         yield
     finally:
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        cleaner.cancel()
+        for t in (task, cleaner):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="節點控制台", lifespan=lifespan)
@@ -977,6 +1045,33 @@ class TargetBody(BaseModel):
     authorized_days: int = 30
     authorized_until: Optional[str] = None
     enabled: bool = True
+
+
+# ---------------------------------------------------------------- 對接：雲端開服
+# 另一個機器人（華為雲開服）在建立 ECS 後呼叫 /api/hooks/ecs，
+# 這裡負責把新機器登記成節點、用 SSH 自動部署，並在到期或長時間離線後自動移除。
+
+class EcsServerIn(BaseModel):
+    name: str = ""
+    host: str
+    ssh_user: str = "root"
+    ssh_password: str = ""
+    ssh_port: int = 22
+    expires_at: Optional[str] = None
+    max_threads: int = 600
+
+
+class EcsHookBody(BaseModel):
+    batch_id: str = ""
+    servers: list[EcsServerIn]
+    source: str = "ecs"
+
+
+class JoinBody(BaseModel):
+    host: str = ""
+    name: str = ""
+    max_threads: int = 600
+    expires_at: Optional[str] = None
 
 
 KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -1075,6 +1170,9 @@ async def get_state(_=Depends(require_auth)):
             "max_threads": int(cfg.get("max_threads", 0)),
             "enabled": bool(cfg.get("enabled", True)),
             "note": cfg.get("note", ""),
+            "source": cfg.get("source", ""),
+            "expires_at": cfg.get("expires_at"),
+            "batch_id": cfg.get("batch_id", ""),
             "online": st.online,
             "latency_ms": st.latency,
             "ssh_ok": st.ssh_ok,
@@ -1439,6 +1537,147 @@ async def delete_target(key: str, request: Request, _=Depends(require_auth)):
     audit("TARGET-DEL", request.client.host if request.client else "-",
           f"{key} {removed.get('domain', '')}")
     return {"ok": True, "key": key, "targets": len(targets)}
+
+
+# ---------------------------------------------------------------- 對接端點
+
+def _hook_node_key(host: str, name: str) -> str:
+    """由機器名稱與 IP 產生合法且好認的節點 key。"""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name or "").strip("-").lower()[:18]
+    tail = host.replace(".", "-")
+    key = f"{slug}-{tail}" if slug else tail
+    key = re.sub(r"^[^A-Za-z0-9]+", "", key)[:32]
+    return key or "ecs-node"
+
+
+@app.post("/api/hooks/ecs")
+async def ecs_hook(body: EcsHookBody, request: Request):
+    """接收開服機器人送來的新機器清單，自動登記並部署成壓測節點。"""
+    token = request.headers.get("x-lt-token", "")
+    if not HOOK_TOKEN or not hmac.compare_digest(token, HOOK_TOKEN):
+        audit("HOOK-DENY", request.client.host if request.client else "-", "token 不正確")
+        raise HTTPException(status_code=401, detail="token 不正確")
+    if not body.servers:
+        raise HTTPException(status_code=400, detail="servers 不可為空")
+
+    config = load_config()
+    nodes = config.setdefault("nodes", {})
+    accepted, skipped = [], []
+
+    for srv in body.servers:
+        host = (srv.host or "").strip()
+        if not HOST_RE.match(host):
+            skipped.append({"host": host, "reason": "IP 格式不正確"})
+            continue
+        if not 1 <= srv.ssh_port <= 65535:
+            skipped.append({"host": host, "reason": "SSH 埠不正確"})
+            continue
+        if not 1 <= srv.max_threads <= 10000:
+            skipped.append({"host": host, "reason": "執行緒上限不正確"})
+            continue
+
+        key = _hook_node_key(host, srv.name)
+        suffix = 2
+        while key in nodes and nodes[key].get("host") != host:
+            key = f"{_hook_node_key(host, srv.name)[:29]}-{suffix}"
+            suffix += 1
+
+        nodes[key] = {
+            "host": host,
+            "port": 1099,
+            "ssh_port": srv.ssh_port,
+            "region": "雲端",
+            "max_threads": srv.max_threads,
+            "enabled": True,
+            "note": f"自動加入 · {srv.name or host}"[:200],
+            "ssh_user": srv.ssh_user or "root",
+            "source": body.source or "ecs",
+            "batch_id": body.batch_id,
+            "expires_at": srv.expires_at,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if srv.ssh_password:
+            store_cred(key, srv.ssh_user or "root", srv.ssh_password)
+        accepted.append(key)
+
+    save_config(config)
+    audit("HOOK-ECS", request.client.host if request.client else "-",
+          f"batch={body.batch_id} 接受={','.join(accepted) or '-'} 略過={len(skipped)}")
+
+    if accepted:
+        asyncio.create_task(_deploy_hook_nodes(accepted))
+
+    return {
+        "ok": True,
+        "accepted": accepted,
+        "skipped": skipped,
+        "message": f"已登記 {len(accepted)} 台，正在背景部署" if accepted else "沒有可用的機器",
+    }
+
+
+async def _deploy_hook_nodes(keys: list[str]) -> None:
+    """等目前部署任務結束後，把新機器部署成節點。"""
+    waited = 0.0
+    while CURRENT["job"] is not None and waited < 600:
+        await asyncio.sleep(3)
+        waited += 3
+    if CURRENT["job"] is not None:
+        return
+    job = Job("hook", f"自動部署（{len(keys)} 台）", keys)
+    JOBS[job.id] = job
+    CURRENT["job"] = job
+    await run_deploy(job, keys, MASTER_IP)
+
+
+@app.get("/api/hooks/ecs/node.sh")
+async def ecs_join_script(token: str = ""):
+    """回傳自註冊腳本：讓新機器自己安裝節點並回報（不經開服機器人時使用）。"""
+    if not HOOK_TOKEN or not hmac.compare_digest(token, HOOK_TOKEN):
+        raise HTTPException(status_code=401, detail="token 不正確")
+    script = (DEPLOY_DIR / "join-node.sh").read_text(encoding="utf-8")
+    script = script.replace("__MASTER_IP__", MASTER_IP).replace("__HOOK_TOKEN__", HOOK_TOKEN)
+    return Response(content=script, media_type="text/x-shellscript; charset=utf-8")
+
+
+@app.post("/api/hooks/join")
+async def join_hook(body: JoinBody, request: Request):
+    """新機器自己安裝完節點後回報，直接登記為可用節點（不需再 SSH 部署）。"""
+    token = request.headers.get("x-lt-token", "")
+    if not HOOK_TOKEN or not hmac.compare_digest(token, HOOK_TOKEN):
+        raise HTTPException(status_code=401, detail="token 不正確")
+
+    host = (body.host or "").strip() or (request.client.host if request.client else "")
+    if not HOST_RE.match(host):
+        raise HTTPException(status_code=400, detail="IP 格式不正確")
+    if not 1 <= body.max_threads <= 10000:
+        raise HTTPException(status_code=400, detail="執行緒上限不正確")
+
+    config = load_config()
+    nodes = config.setdefault("nodes", {})
+    key = _hook_node_key(host, body.name)
+    suffix = 2
+    while key in nodes and nodes[key].get("host") != host:
+        key = f"{_hook_node_key(host, body.name)[:29]}-{suffix}"
+        suffix += 1
+
+    nodes[key] = {
+        "host": host,
+        "port": 1099,
+        "ssh_port": 22,
+        "region": "雲端",
+        "max_threads": body.max_threads,
+        "enabled": True,
+        "note": f"自註冊 · {body.name or host}"[:200],
+        "ssh_user": "root",
+        "source": "join",
+        "batch_id": "",
+        "expires_at": body.expires_at,
+        "added_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_config(config)
+    audit("HOOK-JOIN", host, f"{key} threads={body.max_threads} expires={body.expires_at or '-'}")
+    asyncio.create_task(probe_node(key, nodes[key]))
+    return {"ok": True, "key": key}
 
 
 @app.post("/api/probe")
