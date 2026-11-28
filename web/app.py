@@ -18,6 +18,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -48,6 +49,7 @@ CONFIG_FILE = PROJECT_DIR / "config" / "nodes.json"
 TARGETS_FILE = PROJECT_DIR / "config" / "targets.json"
 PLANS_DIR = PROJECT_DIR / "plans"
 CRED_FILE = PROJECT_DIR / "config" / "credentials.json"
+USERS_FILE = PROJECT_DIR / "config" / "users.json"
 DEPLOY_DIR = PROJECT_DIR / "deploy"
 STATIC_DIR = BASE_DIR / "static"
 LOG_DIR = PROJECT_DIR / "results" / "deploys"
@@ -108,19 +110,224 @@ def load_token() -> str:
 
 WEB_TOKEN = load_token()
 
+PBKDF2_ITERATIONS = 310_000
+ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,31}$")
+VALID_ROLES = ("admin", "operator")
+SESSION_TTL_DEFAULT = 60 * 60 * 12
+SESSION_TTL_REMEMBER = 60 * 60 * 24 * 7
+_LOGIN_FAILS: dict[str, deque[float]] = {}
 
-def session_value() -> str:
-    return hmac.new(WEB_TOKEN.encode(), b"loadtest-web", hashlib.sha256).hexdigest()
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, iters_s, salt_hex, dk_hex = stored.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iters = int(iters_s)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(dk_hex)
+    except Exception:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+    return hmac.compare_digest(actual, expected)
+
+
+def validate_username(raw: str) -> str:
+    username = (raw or "").strip().lower()
+    if not ACCOUNT_RE.match(username):
+        raise HTTPException(
+            status_code=400,
+            detail="帳號需為 2~32 字元英數字、點、底線或連字號，且須以英數字開頭",
+        )
+    return username
+
+
+def validate_password(password: str) -> str:
+    if not isinstance(password, str) or len(password) < 8:
+        raise HTTPException(status_code=400, detail="密碼長度至少需要 8 個字元")
+    if len(password) > 128:
+        raise HTTPException(status_code=400, detail="密碼不可超過 128 個字元")
+    return password
+
+
+def load_users() -> dict:
+    if not USERS_FILE.exists():
+        return {"version": 1, "users": {}}
+    try:
+        data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("users"), dict):
+            return {"version": 1, "users": {}}
+        data.setdefault("version", 1)
+        return data
+    except Exception:
+        return {"version": 1, "users": {}}
+
+
+def save_users(data: dict) -> None:
+    USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = USERS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(USERS_FILE)
+    try:
+        USERS_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _user_public(username: str, rec: dict) -> dict:
+    return {
+        "username": username,
+        "display_name": rec.get("display_name") or username,
+        "role": rec.get("role", "operator"),
+        "enabled": bool(rec.get("enabled", True)),
+        "created_at": rec.get("created_at", ""),
+        "updated_at": rec.get("updated_at", ""),
+        "last_login_at": rec.get("last_login_at", ""),
+        "last_login_ip": rec.get("last_login_ip", ""),
+    }
+
+
+def _count_enabled_admins(users: dict) -> int:
+    return sum(
+        1 for rec in users.values()
+        if rec.get("role") == "admin" and rec.get("enabled", True)
+    )
+
+
+def _seed_admin_from_env() -> None:
+    store = load_users()
+    if store["users"]:
+        return
+    env_user = os.getenv("WEB_ADMIN_USER", "").strip()
+    env_pass = os.getenv("WEB_ADMIN_PASS", "").strip()
+    if not env_user or not env_pass:
+        return
+    try:
+        username = validate_username(env_user)
+        validate_password(env_pass)
+    except HTTPException as exc:
+        print(f"[web] WEB_ADMIN_USER / WEB_ADMIN_PASS 格式無效，略過自動建立：{exc.detail}")
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    store["users"][username] = {
+        "display_name": "系統管理員",
+        "role": "admin",
+        "enabled": True,
+        "password_hash": hash_password(env_pass),
+        "token_version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "last_login_at": "",
+        "last_login_ip": "",
+    }
+    save_users(store)
+    print(f"[web] 已依環境變數建立初始管理員帳號：{username}")
+
+
+_seed_admin_from_env()
+
+
+def _sign_session(payload_b64: str) -> str:
+    return hmac.new(
+        WEB_TOKEN.encode("utf-8"),
+        b"lw-sess:" + payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def make_session_cookie(username: str, token_version: int, ttl: int) -> str:
+    payload = {"u": username, "v": int(token_version), "exp": int(time.time()) + ttl}
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"{payload_b64}.{_sign_session(payload_b64)}"
+
+
+def _set_session_cookie(response: JSONResponse, username: str, token_version: int, remember: bool = False) -> None:
+    ttl = SESSION_TTL_REMEMBER if remember else SESSION_TTL_DEFAULT
+    response.set_cookie(
+        "lw_session",
+        make_session_cookie(username, token_version, ttl),
+        httponly=True,
+        samesite="lax",
+        max_age=ttl,
+        path="/",
+    )
+
+
+def current_user(request: Request) -> Optional[dict]:
+    cookie = request.cookies.get("lw_session", "")
+    if not cookie or "." not in cookie:
+        return None
+    payload_b64, sig = cookie.split(".", 1)
+    if not payload_b64 or not sig or not hmac.compare_digest(sig, _sign_session(payload_b64)):
+        return None
+    try:
+        pad = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + pad).decode("utf-8"))
+        username = str(payload.get("u", "")).strip().lower()
+        ver = int(payload.get("v", 0))
+        exp = int(payload.get("exp", 0))
+    except Exception:
+        return None
+    if not username or exp < int(time.time()):
+        return None
+    rec = load_users().get("users", {}).get(username)
+    if not rec or not rec.get("enabled", True):
+        return None
+    if int(rec.get("token_version", 1)) != ver:
+        return None
+    return {**rec, "username": username}
 
 
 def is_authed(request: Request) -> bool:
-    cookie = request.cookies.get("lw_session", "")
-    return bool(cookie) and hmac.compare_digest(cookie, session_value())
+    return current_user(request) is not None
 
 
-def require_auth(request: Request) -> None:
-    if not is_authed(request):
+def require_auth(request: Request) -> dict:
+    user = current_user(request)
+    if not user:
         raise HTTPException(status_code=401, detail="未登入")
+    return user
+
+
+def require_admin(request: Request) -> dict:
+    user = require_auth(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="僅管理員可執行此操作")
+    return user
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "-"
+
+
+def _check_rate_limit(ip: str) -> None:
+    now = time.time()
+    q = _LOGIN_FAILS.get(ip)
+    if not q:
+        return
+    while q and now - q[0] > 300:
+        q.popleft()
+    if len(q) >= 8:
+        raise HTTPException(status_code=429, detail="嘗試次數過多，請 5 分鐘後再試")
+
+
+def _record_login_fail(ip: str) -> None:
+    now = time.time()
+    q = _LOGIN_FAILS.setdefault(ip, deque())
+    while q and now - q[0] > 300:
+        q.popleft()
+    q.append(now)
+
+
+def _clear_login_fail(ip: str) -> None:
+    _LOGIN_FAILS.pop(ip, None)
 
 
 def audit(action: str, who: str, detail: str) -> None:
@@ -1011,7 +1218,46 @@ app = FastAPI(title="節點控制台", lifespan=lifespan)
 # ---------------------------------------------------------------- API
 
 class LoginBody(BaseModel):
-    token: str
+    username: str = ""
+    password: str = ""
+    remember: bool = False
+
+
+class SetupBody(BaseModel):
+    setup_token: str
+    username: str
+    display_name: str = ""
+    password: str
+
+
+class ResetWithTokenBody(BaseModel):
+    setup_token: str
+    username: str
+    new_password: str
+
+
+class ChangePasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class UpdateProfileBody(BaseModel):
+    display_name: str = ""
+
+
+class UserCreateBody(BaseModel):
+    username: str
+    display_name: str = ""
+    password: str
+    role: str = "operator"
+    enabled: bool = True
+
+
+class UserUpdateBody(BaseModel):
+    display_name: Optional[str] = None
+    role: Optional[str] = None
+    enabled: Optional[bool] = None
+    new_password: Optional[str] = None
 
 
 class DeployBody(BaseModel):
@@ -1135,33 +1381,301 @@ def validate_node(body: NodeBody) -> dict:
     }
 
 
-@app.post("/api/login")
-async def login(body: LoginBody, request: Request):
-    if not hmac.compare_digest(body.token.strip(), WEB_TOKEN):
-        audit("LOGIN-FAIL", request.client.host if request.client else "-", "")
-        raise HTTPException(status_code=401, detail="權杖不正確")
-    response = JSONResponse({"ok": True})
-    response.set_cookie(
-        "lw_session",
-        session_value(),
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 12,
-        path="/",
-    )
-    audit("LOGIN", request.client.host if request.client else "-", "")
+@app.post("/api/setup")
+async def setup_admin(body: SetupBody, request: Request):
+    ip = _client_ip(request)
+    _check_rate_limit(ip)
+    store = load_users()
+    if store["users"]:
+        raise HTTPException(status_code=409, detail="系統已完成初始化設定")
+    if not hmac.compare_digest(body.setup_token.strip(), WEB_TOKEN):
+        _record_login_fail(ip)
+        audit("SETUP-FAIL", ip, "invalid setup token")
+        raise HTTPException(status_code=401, detail="初始化金鑰不正確")
+
+    username = validate_username(body.username)
+    password = validate_password(body.password)
+    display_name = (body.display_name or "").strip()[:40] or "系統管理員"
+    now = datetime.now().isoformat(timespec="seconds")
+    rec = {
+        "display_name": display_name,
+        "role": "admin",
+        "enabled": True,
+        "password_hash": hash_password(password),
+        "token_version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "last_login_at": now,
+        "last_login_ip": ip,
+    }
+    store["users"][username] = rec
+    save_users(store)
+    _clear_login_fail(ip)
+    response = JSONResponse({"ok": True, "user": _user_public(username, rec)})
+    _set_session_cookie(response, username, 1, remember=False)
+    audit("SETUP", ip, f"admin={username}")
     return response
 
 
+@app.post("/api/login")
+async def login(body: LoginBody, request: Request):
+    ip = _client_ip(request)
+    _check_rate_limit(ip)
+    store = load_users()
+    users = store.get("users", {})
+    if not users:
+        raise HTTPException(status_code=400, detail="請先完成初次管理員帳號設定")
+
+    username = (body.username or "").strip().lower()
+    password = body.password or ""
+    rec = users.get(username)
+    if not rec or not verify_password(password, rec.get("password_hash", "")):
+        _record_login_fail(ip)
+        audit("LOGIN-FAIL", ip, f"user={username or '-'}")
+        raise HTTPException(status_code=401, detail="帳號或密碼不正確")
+    if not rec.get("enabled", True):
+        audit("LOGIN-DENY", ip, f"disabled user={username}")
+        raise HTTPException(status_code=403, detail="此帳號已被停用，請聯繫管理員")
+
+    _clear_login_fail(ip)
+    now = datetime.now().isoformat(timespec="seconds")
+    rec["last_login_at"] = now
+    rec["last_login_ip"] = ip
+    save_users(store)
+
+    ver = int(rec.get("token_version", 1))
+    response = JSONResponse({"ok": True, "user": _user_public(username, rec)})
+    _set_session_cookie(response, username, ver, remember=body.remember)
+    audit("LOGIN", ip, f"user={username}")
+    return response
+
+
+@app.post("/api/auth/reset")
+async def reset_password_with_token(body: ResetWithTokenBody, request: Request):
+    ip = _client_ip(request)
+    _check_rate_limit(ip)
+    if not hmac.compare_digest(body.setup_token.strip(), WEB_TOKEN):
+        _record_login_fail(ip)
+        audit("RESET-FAIL", ip, "invalid recovery token")
+        raise HTTPException(status_code=401, detail="救援金鑰不正確")
+
+    username = (body.username or "").strip().lower()
+    store = load_users()
+    rec = store.get("users", {}).get(username)
+    if not rec:
+        raise HTTPException(status_code=404, detail="找不到此帳號")
+
+    new_password = validate_password(body.new_password)
+    rec["password_hash"] = hash_password(new_password)
+    rec["token_version"] = int(rec.get("token_version", 1)) + 1
+    rec["enabled"] = True
+    rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_users(store)
+    _clear_login_fail(ip)
+    audit("PWD-RESET", ip, f"user={username}")
+    return {"ok": True}
+
+
 @app.post("/api/logout")
-async def logout():
+async def logout(request: Request):
+    user = current_user(request)
+    if user:
+        audit("LOGOUT", _client_ip(request), f"user={user['username']}")
     response = JSONResponse({"ok": True})
     response.delete_cookie("lw_session", path="/")
     return response
 
 
+@app.post("/api/account/password")
+async def change_own_password(
+    body: ChangePasswordBody,
+    request: Request,
+    user: dict = Depends(require_auth),
+):
+    store = load_users()
+    username = user["username"]
+    rec = store.get("users", {}).get(username)
+    if not rec:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    if not verify_password(body.current_password or "", rec.get("password_hash", "")):
+        raise HTTPException(status_code=400, detail="目前密碼不正確")
+
+    new_password = validate_password(body.new_password)
+    rec["password_hash"] = hash_password(new_password)
+    new_ver = int(rec.get("token_version", 1)) + 1
+    rec["token_version"] = new_ver
+    rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_users(store)
+    audit("PWD-CHANGE", _client_ip(request), f"user={username}")
+
+    response = JSONResponse({"ok": True})
+    _set_session_cookie(response, username, new_ver, remember=False)
+    return response
+
+
+@app.put("/api/account/profile")
+async def update_own_profile(
+    body: UpdateProfileBody,
+    request: Request,
+    user: dict = Depends(require_auth),
+):
+    store = load_users()
+    username = user["username"]
+    rec = store.get("users", {}).get(username)
+    if not rec:
+        raise HTTPException(status_code=404, detail="帳號不存在")
+    rec["display_name"] = (body.display_name or "").strip()[:40] or username
+    rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_users(store)
+    audit("PROFILE", _client_ip(request), f"user={username}")
+    return {"ok": True, "user": _user_public(username, rec)}
+
+
+@app.get("/api/users")
+async def list_users(_: dict = Depends(require_admin)):
+    users = load_users().get("users", {})
+    return {"items": [_user_public(k, v) for k, v in users.items()]}
+
+
+@app.post("/api/users")
+async def create_user(
+    body: UserCreateBody,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    username = validate_username(body.username)
+    password = validate_password(body.password)
+    role = (body.role or "operator").strip().lower()
+    if role not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail="角色僅支援 admin 或 operator")
+
+    store = load_users()
+    users = store.setdefault("users", {})
+    if username in users:
+        raise HTTPException(status_code=409, detail=f"帳號 {username} 已存在")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    rec = {
+        "display_name": (body.display_name or "").strip()[:40] or username,
+        "role": role,
+        "enabled": bool(body.enabled),
+        "password_hash": hash_password(password),
+        "token_version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "last_login_at": "",
+        "last_login_ip": "",
+    }
+    users[username] = rec
+    save_users(store)
+    audit("USER-ADD", _client_ip(request), f"by={admin['username']} target={username} role={role}")
+    return {"ok": True, "user": _user_public(username, rec)}
+
+
+@app.put("/api/users/{username}")
+async def update_user(
+    username: str,
+    body: UserUpdateBody,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    target_name = (username or "").strip().lower()
+    store = load_users()
+    users = store.get("users", {})
+    rec = users.get(target_name)
+    if not rec:
+        raise HTTPException(status_code=404, detail="找不到此帳號")
+
+    new_role = rec.get("role", "operator")
+    if body.role is not None:
+        candidate = body.role.strip().lower()
+        if candidate not in VALID_ROLES:
+            raise HTTPException(status_code=400, detail="角色僅支援 admin 或 operator")
+        new_role = candidate
+
+    new_enabled = bool(rec.get("enabled", True)) if body.enabled is None else bool(body.enabled)
+
+    if target_name == admin["username"] and not new_enabled:
+        raise HTTPException(status_code=400, detail="不可停用目前登入中的自己的帳號")
+
+    was_enabled_admin = rec.get("role") == "admin" and rec.get("enabled", True)
+    will_be_enabled_admin = new_role == "admin" and new_enabled
+    if was_enabled_admin and not will_be_enabled_admin and _count_enabled_admins(users) <= 1:
+        raise HTTPException(status_code=400, detail="必須至少保留一位啟用中的系統管理員")
+
+    if body.display_name is not None:
+        rec["display_name"] = body.display_name.strip()[:40] or target_name
+    rec["role"] = new_role
+    rec["enabled"] = new_enabled
+
+    bump_ver = False
+    if not new_enabled:
+        bump_ver = True
+    if body.new_password is not None and body.new_password != "":
+        rec["password_hash"] = hash_password(validate_password(body.new_password))
+        bump_ver = True
+    if bump_ver:
+        rec["token_version"] = int(rec.get("token_version", 1)) + 1
+
+    rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_users(store)
+    audit("USER-EDIT", _client_ip(request),
+          f"by={admin['username']} target={target_name} role={new_role} enabled={new_enabled}")
+
+    response = JSONResponse({"ok": True, "user": _user_public(target_name, rec)})
+    if target_name == admin["username"] and bump_ver and new_enabled:
+        _set_session_cookie(response, target_name, int(rec["token_version"]), remember=False)
+    return response
+
+
+@app.post("/api/users/{username}/revoke")
+async def revoke_user_sessions(
+    username: str,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    target_name = (username or "").strip().lower()
+    store = load_users()
+    rec = store.get("users", {}).get(target_name)
+    if not rec:
+        raise HTTPException(status_code=404, detail="找不到此帳號")
+    new_ver = int(rec.get("token_version", 1)) + 1
+    rec["token_version"] = new_ver
+    rec["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    save_users(store)
+    audit("USER-REVOKE", _client_ip(request), f"by={admin['username']} target={target_name}")
+
+    is_self = target_name == admin["username"]
+    response = JSONResponse({"ok": True, "self": is_self})
+    if is_self:
+        _set_session_cookie(response, target_name, new_ver, remember=False)
+    return response
+
+
+@app.delete("/api/users/{username}")
+async def delete_user(
+    username: str,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    target_name = (username or "").strip().lower()
+    if target_name == admin["username"]:
+        raise HTTPException(status_code=400, detail="不可刪除目前登入中的自己的帳號")
+    store = load_users()
+    users = store.get("users", {})
+    rec = users.get(target_name)
+    if not rec:
+        raise HTTPException(status_code=404, detail="找不到此帳號")
+    if rec.get("role") == "admin" and rec.get("enabled", True) and _count_enabled_admins(users) <= 1:
+        raise HTTPException(status_code=400, detail="不可刪除最後一位啟用中的系統管理員")
+    users.pop(target_name)
+    save_users(store)
+    audit("USER-DEL", _client_ip(request), f"by={admin['username']} target={target_name}")
+    return {"ok": True}
+
+
 @app.get("/api/state")
-async def get_state(_=Depends(require_auth)):
+async def get_state(user: dict = Depends(require_auth)):
     config = load_config()
     nodes_cfg = config.get("nodes", {})
     creds = load_creds()
@@ -1225,6 +1739,8 @@ async def get_state(_=Depends(require_auth)):
         "job": job.summary() if job else None,
         "bot": await asyncio.to_thread(bot_status),
         "loadtest": await asyncio.to_thread(loadtest_status),
+        "me": _user_public(user["username"], user),
+        "users_count": len(load_users().get("users", {})) if user.get("role") == "admin" else None,
     }
 
 
@@ -2189,7 +2705,13 @@ async def stream_job(job_id: str, request: Request):
 
 @app.get("/api/session")
 async def session_info(request: Request):
-    return {"authed": is_authed(request)}
+    users = load_users().get("users", {})
+    user = current_user(request)
+    return {
+        "authed": user is not None,
+        "setup_required": len(users) == 0,
+        "user": _user_public(user["username"], user) if user else None,
+    }
 
 
 # ---------------------------------------------------------------- 靜態資源

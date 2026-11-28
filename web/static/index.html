@@ -14,10 +14,12 @@
 <!-- Toast 容器 -->
 <div id="toast-root" class="toast-root" aria-live="polite"></div>
 
-<!-- 登入層 -->
+<!-- 登入 / 初始化 / 密碼救援層 -->
 <div id="login" class="login">
   <div class="login-backdrop" aria-hidden="true"></div>
-  <form class="login-card" id="login-form">
+
+  <!-- 模式 1：帳號密碼登入 -->
+  <form class="login-card" id="login-form" autocomplete="on">
     <div class="login-emblem">
       <div class="brand-mark large">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -27,23 +29,153 @@
     </div>
     <div class="login-kicker">LOADTEST CONTROL PLANE</div>
     <h1>節點控制台</h1>
-    <p class="muted">分散式壓測叢集管理與節點部署入口，請輸入存取權杖以繼續。</p>
-    <div class="token-wrap">
-      <input id="token" type="password" placeholder="輸入 WEB_TOKEN" autocomplete="current-password" required>
-      <button type="button" class="token-eye" id="btn-toggle-token" title="顯示／隱藏權杖" aria-label="顯示或隱藏權杖">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/>
-          <circle cx="12" cy="12" r="3"/>
+    <p class="muted">請使用管理員或操作員帳號登入系統。</p>
+
+    <div class="auth-field">
+      <label class="auth-label" for="login-username">管理帳號</label>
+      <div class="input-icon-wrap">
+        <svg class="input-leading" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
         </svg>
-      </button>
+        <input id="login-username" name="username" type="text" placeholder="輸入管理帳號" autocomplete="username" required>
+      </div>
     </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="login-password">登入密碼</label>
+      <div class="input-icon-wrap has-eye">
+        <svg class="input-leading" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        <input id="login-password" name="password" type="password" placeholder="輸入登入密碼" autocomplete="current-password" required>
+        <button type="button" class="token-eye" id="btn-toggle-password" title="顯示／隱藏密碼" aria-label="顯示或隱藏密碼">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="auth-row">
+      <label class="check">
+        <input type="checkbox" id="login-remember" name="remember">
+        <span>保持登入 7 天</span>
+      </label>
+      <button type="button" class="link-btn" id="btn-show-reset">忘記密碼？</button>
+    </div>
+
     <button type="submit" class="btn primary wide lg" id="btn-login-submit">
-      <span>驗證並進入控制台</span>
+      <span>登入控制台</span>
       <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M5 12h14M13 5l7 7-7 7"/>
       </svg>
     </button>
     <p id="login-error" class="err-text"></p>
+  </form>
+
+  <!-- 模式 2：首次初始化管理員帳號 -->
+  <form class="login-card hidden" id="setup-form" autocomplete="off">
+    <div class="login-emblem">
+      <div class="brand-mark large">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+      </div>
+    </div>
+    <div class="setup-badge">首次部署初始化</div>
+    <h1>建立管理員帳號</h1>
+    <p class="muted">系統尚未建立任何登入帳號，請驗證伺服器初始化金鑰並設定首位管理員。</p>
+
+    <div class="auth-field">
+      <label class="auth-label" for="setup-token">初始化金鑰（WEB_TOKEN）<span class="auth-hint-inline">位於 .env 或 .web_token</span></label>
+      <div class="input-icon-wrap has-eye">
+        <svg class="input-leading" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+        </svg>
+        <input id="setup-token" type="password" placeholder="貼上 WEB_TOKEN" autocomplete="off" required>
+        <button type="button" class="token-eye" id="btn-toggle-setup-token" title="顯示／隱藏金鑰" aria-label="顯示或隱藏初始化金鑰">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="auth-grid-2">
+      <div class="auth-field">
+        <label class="auth-label" for="setup-username">管理員帳號</label>
+        <input id="setup-username" type="text" value="admin" placeholder="admin" minlength="2" maxlength="32" required>
+      </div>
+      <div class="auth-field">
+        <label class="auth-label" for="setup-display-name">顯示名稱</label>
+        <input id="setup-display-name" type="text" value="系統管理員" placeholder="系統管理員" maxlength="40">
+      </div>
+    </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="setup-password">登入密碼（至少 8 碼）</label>
+      <input id="setup-password" type="password" placeholder="設定高強度密碼" minlength="8" autocomplete="new-password" required>
+      <div class="strength-meter" id="setup-strength">
+        <div class="strength-bar"><div class="strength-fill"></div></div>
+        <span class="strength-text">請輸入至少 8 字元</span>
+      </div>
+    </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="setup-password2">確認登入密碼</label>
+      <input id="setup-password2" type="password" placeholder="再次輸入密碼" minlength="8" autocomplete="new-password" required>
+    </div>
+
+    <button type="submit" class="btn primary wide lg" id="btn-setup-submit">
+      <span>建立管理員並登入</span>
+    </button>
+    <p id="setup-error" class="err-text"></p>
+  </form>
+
+  <!-- 模式 3：使用伺服器金鑰重設密碼 -->
+  <form class="login-card hidden" id="reset-form" autocomplete="off">
+    <div class="login-emblem">
+      <div class="brand-mark large">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+        </svg>
+      </div>
+    </div>
+    <div class="login-kicker">EMERGENCY RECOVERY</div>
+    <h1>重設登入密碼</h1>
+    <p class="muted">輸入伺服器上的主金鑰（WEB_TOKEN）以重設指定帳號密碼。</p>
+
+    <div class="auth-field">
+      <label class="auth-label" for="reset-token">伺服器救援金鑰（WEB_TOKEN）</label>
+      <input id="reset-token" type="password" placeholder="貼上 WEB_TOKEN" autocomplete="off" required>
+    </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="reset-username">要重設的帳號</label>
+      <input id="reset-username" type="text" placeholder="admin" required>
+    </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="reset-password">新密碼（至少 8 碼）</label>
+      <input id="reset-password" type="password" placeholder="設定新密碼" minlength="8" autocomplete="new-password" required>
+      <div class="strength-meter" id="reset-strength">
+        <div class="strength-bar"><div class="strength-fill"></div></div>
+        <span class="strength-text">請輸入至少 8 字元</span>
+      </div>
+    </div>
+
+    <div class="auth-field">
+      <label class="auth-label" for="reset-password2">確認新密碼</label>
+      <input id="reset-password2" type="password" placeholder="再次輸入新密碼" minlength="8" autocomplete="new-password" required>
+    </div>
+
+    <div class="auth-actions-split">
+      <button type="button" class="btn" id="btn-reset-back">返回登入</button>
+      <button type="submit" class="btn primary" id="btn-reset-submit">重設密碼</button>
+    </div>
+    <p id="reset-error" class="err-text"></p>
   </form>
 </div>
 
@@ -98,6 +230,13 @@
         <span class="nav-label">部署終端</span>
         <span class="nav-badge" id="nav-badge-deploy">閒置</span>
       </button>
+
+      <div class="nav-group-label">系統與權限</div>
+      <button type="button" class="nav-item" data-nav="accounts">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span class="nav-label">帳號與安全</span>
+        <span class="nav-badge" id="nav-badge-accounts">—</span>
+      </button>
     </nav>
 
     <div class="sidebar-footer">
@@ -134,6 +273,11 @@
       <div class="topbar-right">
         <span class="chip" id="chip-online">— 在線</span>
         <span class="chip" id="chip-capacity">容量 —</span>
+        <button type="button" class="user-pill" id="user-pill" title="前往帳號與安全設定">
+          <span class="avatar-circle" id="user-avatar">A</span>
+          <span class="user-pill-name" id="user-name">—</span>
+          <span class="user-pill-role" id="user-role">—</span>
+        </button>
         <button class="btn ghost small icon-text" id="btn-refresh" title="立即重新探測">
           <svg class="spin-icon" viewBox="0 0 24 24" width="13.5" height="13.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
           <span>重新整理</span>
@@ -343,6 +487,92 @@
           <div class="log-empty">尚無部署任務。點擊上方「一鍵部署全部節點」或單一節點的「部署」按鈕開始。</div>
         </div>
       </section>
+
+      <!-- 帳號與安全 -->
+      <section class="accounts-wrap" data-section="accounts">
+        <div class="accounts-top-grid">
+          <!-- 我的帳號 -->
+          <section class="panel">
+            <div class="panel-head">
+              <div class="panel-title-wrap">
+                <h2>我的帳號</h2>
+                <span class="badge" id="profile-role">—</span>
+              </div>
+            </div>
+            <div class="profile-body">
+              <div class="profile-summary">
+                <div class="avatar-circle lg" id="profile-avatar">A</div>
+                <div class="profile-meta">
+                  <div class="profile-display-name" id="profile-display-name">—</div>
+                  <div class="profile-username mono" id="profile-username">@—</div>
+                  <div class="profile-last-login" id="profile-last-login">最近登入：—</div>
+                </div>
+              </div>
+              <form id="profile-form" class="account-form" autocomplete="off">
+                <label class="field">
+                  <span>顯示名稱</span>
+                  <input name="display_name" maxlength="40" placeholder="例如：Ops Admin">
+                </label>
+                <div class="account-form-foot">
+                  <button type="submit" class="btn primary small">儲存顯示名稱</button>
+                  <span class="form-status" id="profile-status"></span>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <!-- 修改密碼 -->
+          <section class="panel">
+            <div class="panel-head">
+              <div class="panel-title-wrap">
+                <h2>修改登入密碼</h2>
+              </div>
+              <span class="spacer"></span>
+              <span class="results-hint">修改後會自動登出其他裝置</span>
+            </div>
+            <div class="profile-body">
+              <form id="password-form" class="account-form" autocomplete="off">
+                <label class="field">
+                  <span>目前密碼</span>
+                  <input name="current_password" type="password" placeholder="輸入目前使用的密碼" autocomplete="current-password" required>
+                </label>
+                <label class="field">
+                  <span>新密碼（至少 8 碼）</span>
+                  <input name="new_password" id="pwd-new" type="password" placeholder="設定高強度新密碼" minlength="8" autocomplete="new-password" required>
+                </label>
+                <div class="strength-meter" id="pwd-strength">
+                  <div class="strength-bar"><div class="strength-fill"></div></div>
+                  <span class="strength-text">請輸入至少 8 字元</span>
+                </div>
+                <label class="field">
+                  <span>確認新密碼</span>
+                  <input name="confirm_password" type="password" placeholder="再次輸入新密碼" minlength="8" autocomplete="new-password" required>
+                </label>
+                <div class="account-form-foot">
+                  <button type="submit" class="btn primary small">更新密碼</button>
+                  <span class="form-status" id="password-status"></span>
+                </div>
+              </form>
+            </div>
+          </section>
+        </div>
+
+        <!-- 後台帳號管理（僅管理員可見） -->
+        <section class="panel hidden" id="admin-users-panel">
+          <div class="panel-head">
+            <div class="panel-title-wrap">
+              <h2>後台帳號管理</h2>
+              <span class="chip" id="users-count">—</span>
+            </div>
+            <span class="spacer"></span>
+            <span class="results-hint">管理控制台登入帳號、角色權限與連線狀態</span>
+            <button type="button" class="btn primary small" id="btn-add-user">新增帳號</button>
+          </div>
+          <div class="users-list" id="users-list">
+            <div class="results-empty">載入帳號清單中…</div>
+          </div>
+        </section>
+      </section>
     </main>
   </div>
 </div>
@@ -465,6 +695,54 @@
       <span class="spacer"></span>
       <button type="button" class="btn" id="btn-target-cancel">取消</button>
       <button type="submit" class="btn primary" id="btn-target-save">儲存</button>
+    </div>
+  </form>
+</div>
+
+<!-- 新增／編輯使用者帳號彈窗 -->
+<div id="user-modal" class="modal hidden">
+  <form class="modal-card form-card" id="user-form" autocomplete="off">
+    <div class="modal-head">
+      <h3 id="user-modal-title">新增帳號</h3>
+      <button type="button" class="icon-btn" id="user-modal-close" aria-label="關閉">×</button>
+    </div>
+    <div class="form-body">
+      <label class="field">
+        <span>帳號名稱</span>
+        <input name="username" required minlength="2" maxlength="32" placeholder="ops-01">
+      </label>
+      <label class="field">
+        <span>顯示名稱</span>
+        <input name="display_name" maxlength="40" placeholder="維運人員">
+      </label>
+      <label class="field span2">
+        <span>角色權限</span>
+        <select name="role">
+          <option value="operator">操作員（可使用控制台功能，無帳號管理權限）</option>
+          <option value="admin">系統管理員（擁有完整帳號與系統管理權限）</option>
+        </select>
+      </label>
+      <div class="field span2">
+        <span id="user-pwd-label">登入密碼（至少 8 碼）</span>
+        <div class="pwd-gen-row">
+          <input name="password" id="user-modal-password" type="password" placeholder="至少 8 字元" minlength="8" autocomplete="new-password">
+          <button type="button" class="btn small" id="btn-gen-password">隨機產生</button>
+        </div>
+        <div class="strength-meter" id="user-pwd-strength">
+          <div class="strength-bar"><div class="strength-fill"></div></div>
+          <span class="strength-text">請輸入至少 8 字元</span>
+        </div>
+      </div>
+      <label class="check span2">
+        <input type="checkbox" name="enabled" checked>
+        <span>啟用此帳號（停用後無法登入且既有工作階段立即失效）</span>
+      </label>
+      <div class="form-status span2" id="user-form-status"></div>
+    </div>
+    <div class="form-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="btn-user-cancel">取消</button>
+      <button type="submit" class="btn primary" id="btn-user-save">儲存</button>
     </div>
   </form>
 </div>

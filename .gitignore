@@ -3,6 +3,7 @@
 .env.local
 .web_token
 config/credentials.json
+config/users.json
 *.pem
 *.key
 

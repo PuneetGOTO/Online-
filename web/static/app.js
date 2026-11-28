@@ -12,9 +12,11 @@ const VIEW_TITLES = {
   reports: '壓測報告',
   bot: 'Discord 機器人',
   deploy: '部署終端',
+  accounts: '帳號與安全',
 };
 
 let latestState = null;
+let currentUser = null;
 let activeJobId = null;
 let editingKey = null;
 let jobTimer = null;
@@ -47,6 +49,9 @@ function setView(view) {
   });
   sessionStorage.setItem('lt_view', targetView);
   $('#app').classList.remove('sidebar-open');
+  if (targetView === 'accounts' && currentUser && currentUser.role === 'admin') {
+    loadUsers();
+  }
 }
 
 $$('.nav-item[data-nav]').forEach((btn) => {
@@ -102,26 +107,40 @@ async function copyText(text) {
 }
 
 async function api(path, options = {}) {
+  const { skipAuthRedirect = false, ...fetchOpts } = options;
   const res = await fetch(path, {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    ...options,
+    ...fetchOpts,
   });
-  if (res.status === 401) {
-    showLogin();
-    throw new Error('unauth');
-  }
   let data = null;
   try { data = await res.json(); } catch (_) { /* 無 JSON 內容 */ }
+  if (res.status === 401 && !skipAuthRedirect) {
+    showLogin(false);
+    throw new Error('unauth');
+  }
   if (!res.ok) throw new Error((data && data.detail) || `HTTP ${res.status}`);
   return data;
 }
 
-function showLogin() {
+function showAuthMode(mode) {
+  $('#login-form').classList.toggle('hidden', mode !== 'login');
+  $('#setup-form').classList.toggle('hidden', mode !== 'setup');
+  $('#reset-form').classList.toggle('hidden', mode !== 'reset');
+  $('#login-error').textContent = '';
+  $('#setup-error').textContent = '';
+  $('#reset-error').textContent = '';
+  if (mode === 'login') setTimeout(() => $('#login-username').focus(), 30);
+  if (mode === 'setup') setTimeout(() => $('#setup-token').focus(), 30);
+  if (mode === 'reset') setTimeout(() => $('#reset-token').focus(), 30);
+}
+
+function showLogin(setupRequired = false) {
+  currentUser = null;
   $('#login').classList.remove('hidden');
   $('#app').classList.add('hidden');
   stopTimers();
-  $('#token').focus();
+  showAuthMode(setupRequired ? 'setup' : 'login');
 }
 
 function showApp() {
@@ -134,12 +153,54 @@ function stopTimers() {
   if (jobTimer) { clearInterval(jobTimer); jobTimer = null; }
 }
 
-/* ---------------------------------------------------------------- 登入 */
+function updateStrength(inputEl, meterEl) {
+  if (!inputEl || !meterEl) return;
+  const val = inputEl.value || '';
+  const fill = meterEl.querySelector('.strength-fill');
+  const text = meterEl.querySelector('.strength-text');
+  if (!val) {
+    fill.className = 'strength-fill';
+    text.textContent = '請輸入至少 8 字元';
+    return;
+  }
+  let score = 0;
+  if (val.length >= 8) score += 1;
+  if (val.length >= 12) score += 1;
+  if (/[a-z]/.test(val) && /[A-Z]/.test(val)) score += 1;
+  if (/\d/.test(val) && /[^A-Za-z0-9]/.test(val)) score += 1;
+  const lvl = val.length < 8 ? 1 : Math.max(1, Math.min(4, score));
+  const labels = ['', '弱（建議加長）', '普通', '良好', '高強度'];
+  fill.className = `strength-fill s${lvl}`;
+  text.textContent = labels[lvl];
+}
 
-$('#btn-toggle-token').addEventListener('click', () => {
-  const input = $('#token');
+/* ---------------------------------------------------------------- 登入 / 初始化 / 重設 */
+
+$('#btn-toggle-password').addEventListener('click', () => {
+  const input = $('#login-password');
   input.type = input.type === 'password' ? 'text' : 'password';
   input.focus();
+});
+
+$('#btn-toggle-setup-token').addEventListener('click', () => {
+  const input = $('#setup-token');
+  input.type = input.type === 'password' ? 'text' : 'password';
+  input.focus();
+});
+
+$('#btn-show-reset').addEventListener('click', () => {
+  const u = $('#login-username').value.trim();
+  if (u) $('#reset-username').value = u;
+  showAuthMode('reset');
+});
+
+$('#btn-reset-back').addEventListener('click', () => showAuthMode('login'));
+
+$('#setup-password').addEventListener('input', () => {
+  updateStrength($('#setup-password'), $('#setup-strength'));
+});
+$('#reset-password').addEventListener('input', () => {
+  updateStrength($('#reset-password'), $('#reset-strength'));
 });
 
 $('#login-form').addEventListener('submit', async (event) => {
@@ -150,21 +211,104 @@ $('#login-form').addEventListener('submit', async (event) => {
   try {
     await api('/api/login', {
       method: 'POST',
-      body: JSON.stringify({ token: $('#token').value.trim() }),
+      skipAuthRedirect: true,
+      body: JSON.stringify({
+        username: $('#login-username').value.trim(),
+        password: $('#login-password').value,
+        remember: $('#login-remember').checked,
+      }),
     });
-    $('#token').value = '';
-    $('#token').type = 'password';
+    $('#login-password').value = '';
+    $('#login-password').type = 'password';
     await boot();
   } catch (err) {
-    $('#login-error').textContent = err.message === 'unauth' ? '權杖不正確' : err.message;
+    $('#login-error').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#setup-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('#setup-error').textContent = '';
+  const pwd = $('#setup-password').value;
+  const pwd2 = $('#setup-password2').value;
+  if (pwd.length < 8) {
+    $('#setup-error').textContent = '密碼長度至少需要 8 個字元';
+    return;
+  }
+  if (pwd !== pwd2) {
+    $('#setup-error').textContent = '兩次輸入的密碼不一致';
+    return;
+  }
+  const btn = $('#btn-setup-submit');
+  btn.disabled = true;
+  try {
+    await api('/api/setup', {
+      method: 'POST',
+      skipAuthRedirect: true,
+      body: JSON.stringify({
+        setup_token: $('#setup-token').value.trim(),
+        username: $('#setup-username').value.trim(),
+        display_name: $('#setup-display-name').value.trim(),
+        password: pwd,
+      }),
+    });
+    $('#setup-form').reset();
+    updateStrength($('#setup-password'), $('#setup-strength'));
+    toast('管理員帳號已建立並登入', 'ok');
+    await boot();
+  } catch (err) {
+    $('#setup-error').textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#reset-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('#reset-error').textContent = '';
+  const pwd = $('#reset-password').value;
+  const pwd2 = $('#reset-password2').value;
+  if (pwd.length < 8) {
+    $('#reset-error').textContent = '新密碼長度至少需要 8 個字元';
+    return;
+  }
+  if (pwd !== pwd2) {
+    $('#reset-error').textContent = '兩次輸入的密碼不一致';
+    return;
+  }
+  const btn = $('#btn-reset-submit');
+  btn.disabled = true;
+  const username = $('#reset-username').value.trim();
+  try {
+    await api('/api/auth/reset', {
+      method: 'POST',
+      skipAuthRedirect: true,
+      body: JSON.stringify({
+        setup_token: $('#reset-token').value.trim(),
+        username,
+        new_password: pwd,
+      }),
+    });
+    $('#reset-form').reset();
+    updateStrength($('#reset-password'), $('#reset-strength'));
+    $('#login-username').value = username;
+    showAuthMode('login');
+    toast('密碼已重設，請使用新密碼登入', 'ok');
+  } catch (err) {
+    $('#reset-error').textContent = err.message;
   } finally {
     btn.disabled = false;
   }
 });
 
 $('#btn-logout').addEventListener('click', async () => {
-  await api('/api/logout', { method: 'POST' });
-  showLogin();
+  try {
+    await api('/api/logout', { method: 'POST', skipAuthRedirect: true });
+  } finally {
+    showLogin(false);
+  }
 });
 
 /* ---------------------------------------------------------------- 狀態 */
@@ -186,6 +330,14 @@ async function refreshState() {
 
 function renderState(state) {
   const { server, summary, nodes, job } = state;
+
+  if (state.me) {
+    renderMe(state.me);
+  }
+  const navAccounts = $('#nav-badge-accounts');
+  if (navAccounts) {
+    navAccounts.textContent = state.users_count != null ? String(state.users_count) : '安全';
+  }
 
   $('#server-line').textContent =
     `${server.hostname} · ${server.master_ip} · JMeter ${server.jmeter}`;
@@ -452,6 +604,7 @@ document.addEventListener('keydown', (event) => {
     $('#modal').classList.add('hidden');
     closeNodeModal();
     closeTargetModal();
+    closeUserModal();
     $('#app').classList.remove('sidebar-open');
   }
 });
@@ -1350,6 +1503,343 @@ function renderResults(items) {
   }).join('');
 }
 
+/* ---------------------------------------------------------------- 帳號與安全 */
+
+let latestUsers = [];
+let editingUsername = null;
+
+function roleLabel(role) {
+  return role === 'admin' ? '系統管理員' : '操作員';
+}
+
+function renderMe(user) {
+  if (!user) return;
+  currentUser = user;
+  const initials = (user.display_name || user.username || '?').trim().slice(0, 1).toUpperCase();
+  const roleText = roleLabel(user.role);
+
+  $('#user-avatar').textContent = initials;
+  $('#user-name').textContent = user.display_name || user.username;
+  $('#user-role').textContent = roleText;
+
+  $('#profile-avatar').textContent = initials;
+  $('#profile-display-name').textContent = user.display_name || user.username;
+  $('#profile-username').textContent = `@${user.username}`;
+
+  const roleBadge = $('#profile-role');
+  roleBadge.textContent = roleText;
+  roleBadge.className = 'badge ' + (user.role === 'admin' ? 'ok' : '');
+
+  const lastLogin = user.last_login_at
+    ? `${user.last_login_at.replace('T', ' ')}${user.last_login_ip ? ' · ' + user.last_login_ip : ''}`
+    : '首次登入';
+  $('#profile-last-login').textContent = `最近登入：${lastLogin}`;
+
+  const profileForm = $('#profile-form');
+  if (profileForm && document.activeElement !== profileForm.display_name) {
+    profileForm.display_name.value = user.display_name || '';
+  }
+
+  $('#admin-users-panel').classList.toggle('hidden', user.role !== 'admin');
+}
+
+$('#user-pill').addEventListener('click', () => setView('accounts'));
+
+function setInlineStatus(sel, text, cls) {
+  const el = $(sel);
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'form-status' + (cls ? ' ' + cls : '');
+}
+
+$('#profile-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const displayName = $('#profile-form').display_name.value.trim();
+  setInlineStatus('#profile-status', '儲存中…', 'busy');
+  try {
+    const res = await api('/api/account/profile', {
+      method: 'PUT',
+      body: JSON.stringify({ display_name: displayName }),
+    });
+    renderMe(res.user);
+    setInlineStatus('#profile-status', '已更新顯示名稱', 'ok');
+    toast('已更新顯示名稱', 'ok');
+    if (currentUser && currentUser.role === 'admin') loadUsers();
+  } catch (err) {
+    setInlineStatus('#profile-status', err.message, 'err');
+  }
+});
+
+$('#pwd-new').addEventListener('input', () => {
+  updateStrength($('#pwd-new'), $('#pwd-strength'));
+});
+
+$('#password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = $('#password-form');
+  const currentPassword = form.current_password.value;
+  const newPassword = form.new_password.value;
+  const confirmPassword = form.confirm_password.value;
+
+  if (newPassword.length < 8) {
+    setInlineStatus('#password-status', '新密碼長度至少需要 8 個字元', 'err');
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    setInlineStatus('#password-status', '兩次輸入的新密碼不一致', 'err');
+    return;
+  }
+  setInlineStatus('#password-status', '更新中…', 'busy');
+  try {
+    await api('/api/account/password', {
+      method: 'POST',
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    });
+    form.reset();
+    updateStrength($('#pwd-new'), $('#pwd-strength'));
+    setInlineStatus('#password-status', '密碼已更新，其他裝置已登出', 'ok');
+    toast('登入密碼已更新', 'ok');
+  } catch (err) {
+    setInlineStatus('#password-status', err.message, 'err');
+  }
+});
+
+async function loadUsers() {
+  if (!currentUser || currentUser.role !== 'admin') return;
+  try {
+    const data = await api('/api/users');
+    latestUsers = data.items || [];
+    renderUsers(latestUsers);
+  } catch (err) {
+    if (err.message !== 'unauth') console.warn('[users]', err.message);
+  }
+}
+
+function renderUsers(items) {
+  const box = $('#users-list');
+  const countChip = $('#users-count');
+  const navAccounts = $('#nav-badge-accounts');
+  if (countChip) countChip.textContent = `${items.length} 個帳號`;
+  if (navAccounts) navAccounts.textContent = String(items.length);
+
+  if (!items.length) {
+    box.innerHTML = '<div class="results-empty">尚無帳號資料</div>';
+    return;
+  }
+
+  box.innerHTML = items.map((u) => {
+    const isSelf = currentUser && u.username === currentUser.username;
+    const roleBadge = u.role === 'admin'
+      ? '<span class="badge ok">系統管理員</span>'
+      : '<span class="badge">操作員</span>';
+    const stateBadge = u.enabled
+      ? '<span class="badge ok">啟用中</span>'
+      : '<span class="badge err">已停用</span>';
+    const selfBadge = isSelf ? '<span class="region">目前登入</span>' : '';
+    const lastLogin = u.last_login_at
+      ? `${esc(u.last_login_at.replace('T', ' '))}${u.last_login_ip ? ' (' + esc(u.last_login_ip) + ')' : ''}`
+      : '尚未登入';
+
+    return `
+      <article class="user-row ${u.enabled ? '' : 'off'}">
+        <div class="avatar-circle">${esc((u.display_name || u.username).slice(0, 1).toUpperCase())}</div>
+        <div class="user-row-main">
+          <div class="user-row-head">
+            <span class="user-row-name">${esc(u.display_name || u.username)}</span>
+            <span class="user-row-id mono">@${esc(u.username)}</span>
+            ${roleBadge}
+            ${stateBadge}
+            ${selfBadge}
+          </div>
+          <div class="user-row-meta">
+            <span>建立 <b>${esc((u.created_at || '—').replace('T', ' '))}</b></span>
+            <span>最近登入 <b>${lastLogin}</b></span>
+          </div>
+        </div>
+        <div class="user-row-actions">
+          <label class="switch" title="${u.enabled ? '已啟用' : '已停用'}">
+            <input type="checkbox" data-act="toggle-user" data-username="${esc(u.username)}" ${u.enabled ? 'checked' : ''} ${isSelf ? 'disabled' : ''}>
+            <span class="slider"></span>
+          </label>
+          <button type="button" class="btn small ghost" data-act="revoke-user" data-username="${esc(u.username)}" title="使該帳號所有裝置的工作階段失效">強制下線</button>
+          <button type="button" class="icon-mini" data-act="edit-user" data-username="${esc(u.username)}" title="編輯">${ICON_EDIT}</button>
+          ${isSelf ? '' : `<button type="button" class="icon-mini danger" data-act="delete-user" data-username="${esc(u.username)}" title="刪除">${ICON_TRASH}</button>`}
+        </div>
+      </article>`;
+  }).join('');
+}
+
+const userForm = $('#user-form');
+
+$('#btn-add-user').addEventListener('click', () => openUserModal(null));
+$('#user-modal-close').addEventListener('click', closeUserModal);
+$('#btn-user-cancel').addEventListener('click', closeUserModal);
+$('#user-modal').addEventListener('click', (event) => {
+  if (event.target.id === 'user-modal') closeUserModal();
+});
+
+$('#user-modal-password').addEventListener('input', () => {
+  updateStrength($('#user-modal-password'), $('#user-pwd-strength'));
+});
+
+$('#btn-gen-password').addEventListener('click', async () => {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*';
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let pwd = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    pwd += alphabet[bytes[i] % alphabet.length];
+  }
+  const input = $('#user-modal-password');
+  input.type = 'text';
+  input.value = pwd;
+  updateStrength(input, $('#user-pwd-strength'));
+  try {
+    await copyText(pwd);
+    toast('已產生高強度密碼並複製到剪貼簿', 'ok');
+  } catch (_) {
+    toast('已產生高強度密碼', 'ok');
+  }
+});
+
+function openUserModal(username) {
+  editingUsername = username;
+  userForm.reset();
+  userForm.role.value = 'operator';
+  userForm.enabled.checked = true;
+  userForm.username.readOnly = Boolean(username);
+  const pwdInput = $('#user-modal-password');
+  pwdInput.type = 'password';
+  pwdInput.required = !username;
+  $('#user-pwd-label').textContent = username ? '重設密碼（留空則不變更）' : '登入密碼（至少 8 碼）';
+  pwdInput.placeholder = username ? '留空則保留原密碼' : '至少 8 字元';
+  updateStrength(pwdInput, $('#user-pwd-strength'));
+  setInlineStatus('#user-form-status', '', '');
+  $('#user-modal-title').textContent = username ? `編輯帳號 · @${username}` : '新增帳號';
+
+  if (username) {
+    const target = latestUsers.find((u) => u.username === username);
+    if (target) {
+      userForm.username.value = target.username;
+      userForm.display_name.value = target.display_name || '';
+      userForm.role.value = target.role || 'operator';
+      userForm.enabled.checked = Boolean(target.enabled);
+    }
+  }
+  $('#user-modal').classList.remove('hidden');
+  setTimeout(() => (username ? userForm.display_name : userForm.username).focus(), 50);
+}
+
+function closeUserModal() {
+  const modal = $('#user-modal');
+  if (modal) modal.classList.add('hidden');
+  editingUsername = null;
+}
+
+userForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const username = userForm.username.value.trim().toLowerCase();
+  const displayName = userForm.display_name.value.trim();
+  const role = userForm.role.value;
+  const password = userForm.password.value;
+  const enabled = userForm.enabled.checked;
+
+  if (!editingUsername && password.length < 8) {
+    setInlineStatus('#user-form-status', '密碼長度至少需要 8 個字元', 'err');
+    return;
+  }
+  if (editingUsername && password && password.length < 8) {
+    setInlineStatus('#user-form-status', '新密碼長度至少需要 8 個字元', 'err');
+    return;
+  }
+
+  $('#btn-user-save').disabled = true;
+  setInlineStatus('#user-form-status', '儲存中…', 'busy');
+  try {
+    if (editingUsername) {
+      const payload = {
+        display_name: displayName,
+        role,
+        enabled,
+      };
+      if (password) payload.new_password = password;
+      await api(`/api/users/${encodeURIComponent(editingUsername)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      toast(`已更新帳號 @${editingUsername}`, 'ok');
+    } else {
+      await api('/api/users', {
+        method: 'POST',
+        body: JSON.stringify({
+          username,
+          display_name: displayName,
+          role,
+          password,
+          enabled,
+        }),
+      });
+      toast(`已建立帳號 @${username}`, 'ok');
+    }
+    closeUserModal();
+    await loadUsers();
+    await refreshState();
+  } catch (err) {
+    setInlineStatus('#user-form-status', err.message, 'err');
+  } finally {
+    $('#btn-user-save').disabled = false;
+  }
+});
+
+$('#users-list').addEventListener('click', async (event) => {
+  const btn = event.target.closest('[data-act]');
+  if (!btn) return;
+  const { act, username } = btn.dataset;
+  if (!username) return;
+
+  if (act === 'edit-user') {
+    openUserModal(username);
+  } else if (act === 'revoke-user') {
+    if (!confirm(`確定強制下線帳號 @${username} 的所有已登入裝置？`)) return;
+    try {
+      const res = await api(`/api/users/${encodeURIComponent(username)}/revoke`, { method: 'POST' });
+      toast(res.self ? '已使其他裝置登出（保留目前連線）' : `已強制下線 @${username}`, 'ok');
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  } else if (act === 'delete-user') {
+    if (!confirm(`確定永久刪除帳號 @${username}？刪除後該帳號將無法再登入。`)) return;
+    try {
+      await api(`/api/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+      toast(`已刪除帳號 @${username}`, 'ok');
+      await loadUsers();
+      await refreshState();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+});
+
+$('#users-list').addEventListener('change', async (event) => {
+  const input = event.target.closest('input[data-act="toggle-user"]');
+  if (!input) return;
+  const username = input.dataset.username;
+  try {
+    await api(`/api/users/${encodeURIComponent(username)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled: input.checked }),
+    });
+    toast(`@${username} 已${input.checked ? '啟用' : '停用'}`, 'ok');
+    await loadUsers();
+  } catch (err) {
+    toast(err.message, 'err');
+    input.checked = !input.checked;
+  }
+});
+
 /* ---------------------------------------------------------------- 啟動 */
 
 $('#btn-refresh').addEventListener('click', async () => {
@@ -1365,9 +1855,16 @@ $('#btn-refresh').addEventListener('click', async () => {
 async function boot() {
   try {
     const session = await api('/api/session');
-    if (!session.authed) { showLogin(); return; }
+    if (!session.authed) {
+      showLogin(Boolean(session.setup_required));
+      return;
+    }
+    if (session.user) renderMe(session.user);
     showApp();
     await refreshState();
+    if (currentUser && currentUser.role === 'admin') {
+      loadUsers();
+    }
     if (stateTimer) clearInterval(stateTimer);
     stateTimer = setInterval(refreshState, 5000);
     loadResults();
