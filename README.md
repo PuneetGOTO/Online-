@@ -592,6 +592,58 @@ sudo ufw allow from 203.0.113.0/24 to any port 8080 proto tcp
 **中止**：`/abort` 會中止整場階梯壓測（包含間隔等待階段），並就已完成級別
 產出報告。
 
+### 只指定部分節點
+
+`/start` 與 `/stepped` 都支援 `nodes` 參數，只讓指定節點參與，其餘節點不產生流量：
+
+```
+/start https://example.com/ 443 300 https-get nodes:HK-Huawei
+/stepped https://example.com/ 50,100,200 nodes:hk-1,hk-2
+```
+
+留空或填 `all` 表示全部啟用中的節點。節點名稱要與 `config/nodes.json` 的 key 一致。
+
+**用途**：單節點對照實驗（確認是不是某台節點的網路問題）、或刻意只從特定地區發壓。
+注意分散式模式下有效容量是 `min(各節點上限) × 節點數`，只留一台會讓可用併發變少。
+
+### 多來源 IP 壓測（代理池）
+
+當目標站台有 Cloudflare 這類以「單一 IP 速率」為基礎的防護時，兩台節點的併發再高，
+來源 IP 也只有兩個，很容易被限流（實測約 1,080 req/s 就觸發 403）。
+代理模式讓請求從大量不同 IP 發出，繞開單 IP 限制。
+
+**① 準備清單**：把 udealproxy 的位址填進 `config/proxies.txt`
+（該檔已列入 `.gitignore`，不會進版控；格式範本見 `config/proxies.example.txt`）：
+
+```
+http://user:pass@203.0.113.10:8080
+http://user:pass@203.0.113.11:8080
+socks5://user:pass@203.0.113.12:1080
+```
+
+**② 發壓時加上 `proxy`**：
+
+```
+/start https://example.com/ 443 600 https-get proxy:true
+/stepped https://example.com/ 50,100,200 proxy:true
+```
+
+**運作方式**：
+
+- 每個執行緒在第一次請求時挑選一個代理，之後整個測試都沿用同一個
+  （`執行緒序號 % 代理數量`），因此連線可以重用，不會每個請求都重新握手
+- 代理清單以 base64 編碼後透過 `-G` 傳給遠端引擎，不需要把檔案複製到節點
+- 帳密採用 HTTP Basic（`Proxy-Authorization`），代理先回 `407` 挑戰後 JMeter 自動重送
+
+**限制與注意事項**：
+
+| 項目 | 說明 |
+|---|---|
+| SOCKS5 | JMeter 的取樣器只能設定 HTTP/HTTPS 代理，**無法逐執行緒輪換 SOCKS**。清單若只有 SOCKS 會被拒絕；混用時會自動略過 SOCKS 並在回覆中提示 |
+| 代理品質 | 代理延遲與失敗率會直接反映在壓測結果上，解讀 P90／錯誤率時要先確認不是代理本身的問題 |
+| 代理數量 | 至少準備「併發數 ÷ 10」以上的代理，否則單一代理仍會成為瓶頸 |
+| 用量與授權 | 代理流量通常按量計費，壓測前先確認配額 |
+
 ### 目標生命週期
 
 ```
@@ -665,8 +717,8 @@ Bot 顯示待核准卡片（目標、節點分配、實際併發、時長），O
 
 | 指令 | 權限 | 說明 |
 |---|---|---|
-| `/start url port threads mode` | **OWNER** / 授權管理員 | 一句話壓測，自動建立目標並執行 |
-| `/stepped url stages` | **OWNER** / 授權管理員 | 階梯壓測：逐級加壓找出容量拐點，例 `50,100,200,400` |
+| `/start url port threads mode` | **OWNER** / 授權管理員 | 一句話壓測，自動建立目標並執行；可加 `nodes:` 指定節點、`proxy:true` 走代理池 |
+| `/stepped url stages` | **OWNER** / 授權管理員 | 階梯壓測：逐級加壓找出容量拐點，例 `50,100,200,400`；同樣支援 `nodes:` 與 `proxy:true` |
 | `/target add` | 授權管理員 | 提交目標，產生所有權驗證 token |
 | `/target verify` | 授權管理員 | 驗證域名所有權 |
 | `/target approve` | **OWNER** | 核准目標並設定併發／時長上限；`pending_verify` 狀態可直接核准（跳過驗證，記為 UNVERIFIED） |

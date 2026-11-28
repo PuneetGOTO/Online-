@@ -1,0 +1,23 @@
+# 代理清單範本
+#
+# 複製為 config/proxies.txt 後填入實際代理（該檔案已列入 .gitignore，不會進版控）。
+# 一行一筆，# 開頭為註解。支援以下格式，可混用：
+#
+#   http://user:pass@1.2.3.4:8080      HTTP 代理（帶帳密）
+#   http://1.2.3.4:8080                HTTP 代理（IP 白名單，不帶帳密）
+#   https://user:pass@1.2.3.4:8443     代理連線本身走 TLS
+#   socks5://user:pass@1.2.3.4:1080    SOCKS5（需搭配本地橋接，見 README）
+#   user:pass@1.2.3.4:8080             省略 scheme，預設 http
+#   1.2.3.4:8080                       省略 scheme 與帳密
+#   1.2.3.4:8080:user:pass             冒號分隔四欄
+#   1.2.3.4,8080,user,pass             逗號分隔四欄
+#
+# 注意：
+#   1. 代理數量越多，來源 IP 越分散，越不容易觸發目標站台的單 IP 速率限制。
+#   2. 每個執行緒會固定分配一個代理（不是每個請求都換），以保留連線重用。
+#   3. SOCKS5 無法由 JMeter 取樣器直接設定，需先啟用本地橋接（proxy 模式選 socks）。
+
+# 以下為格式示範，請替換成 udealproxy 提供的實際位址
+# http://user:password@203.0.113.10:8080
+# http://user:password@203.0.113.11:8080
+# socks5://user:password@203.0.113.12:1080

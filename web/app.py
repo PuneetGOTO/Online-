@@ -238,6 +238,7 @@ def write_admins(ids: list[str]) -> None:
 SLASH_COMMANDS = [
     ("/start url port threads https-get", "一句話壓測：網址 埠 併發 協定-方法（OWNER 與授權管理員）"),
     ("/stepped url 50,100,200,400", "階梯壓測：逐級加壓找出容量拐點（OWNER 與授權管理員）"),
+    ("/start … nodes: proxy:", "只指定部分節點，或走代理池模擬多來源 IP"),
     ("/target add", "提交壓測目標，產生所有權驗證 token"),
     ("/target verify", "驗證目標的域名所有權"),
     ("/target approve", "OWNER 核准目標並設定併發上限"),

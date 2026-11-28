@@ -25,6 +25,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from core import distribute as dist
+from core import proxy as px
 from core import stepped as stp
 from core import verify as vfy
 from core.stats import compute_stats, judge
@@ -36,6 +37,7 @@ CONFIG_DIR = BASE_DIR / "config"
 ADMINS_FILE = CONFIG_DIR / "admins.json"
 TARGETS_FILE = CONFIG_DIR / "targets.json"
 NODES_FILE = CONFIG_DIR / "nodes.json"
+PROXIES_FILE = CONFIG_DIR / "proxies.txt"
 PLANS_DIR = BASE_DIR / "plans"
 RESULTS_DIR = BASE_DIR / "results"
 AUDIT_LOG = BASE_DIR / "audit.log"
@@ -120,6 +122,33 @@ def load_nodes() -> dict:
     return _read_json(NODES_FILE).get("nodes", {})
 
 
+def parse_node_selection(text: str, nodes: dict) -> list:
+    """解析 `nodes` 參數：`hk-1,hk-2` 或 `all`。
+
+    回傳要參與的節點名稱清單；空字串或 all 回傳 None（表示全部啟用節點）。
+    """
+    raw = (text or "").strip()
+    if not raw or raw.lower() in ("all", "全部", "所有"):
+        return None
+    wanted = [x.strip() for x in raw.replace("，", ",").replace("、", ",").split(",") if x.strip()]
+    if not wanted:
+        return None
+    unknown = [w for w in wanted if w not in nodes]
+    if unknown:
+        raise ValueError(
+            f"找不到節點 `{'、'.join(unknown)}`。可用節點：{'、'.join(nodes) or '（無）'}"
+        )
+    disabled = [w for w in wanted if not nodes[w].get("enabled", True)]
+    if disabled:
+        raise ValueError(f"節點 `{'、'.join(disabled)}` 已停用，請先在控制台啟用。")
+    return wanted
+
+
+def load_proxy_pool():
+    """讀取代理清單。回傳 (proxies, errors)。"""
+    return px.load(PROXIES_FILE)
+
+
 def audit(action: str, user: str, detail: str) -> None:
     line = f"{datetime.now().isoformat(timespec='seconds')} | {action:12s} | {user} | {detail}\n"
     with open(AUDIT_LOG, "a", encoding="utf-8") as f:
@@ -158,7 +187,7 @@ def plan_path(name: str) -> Path | None:
 async def execute_test(channel, key: str, target: dict, chosen: list,
                        per_node: int, actual_total: int, duration: int,
                        operator: str, override: bool, extra: dict = None,
-                       plan: str = None) -> None:
+                       plan: str = None, global_extra: dict = None) -> None:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     jtl = RESULTS_DIR / f"{key}-{ts}.jtl"
     report = RESULTS_DIR / f"{key}-{ts}-report"
@@ -166,6 +195,7 @@ async def execute_test(channel, key: str, target: dict, chosen: list,
     cmd = dist.build_command(
         JMETER_BIN, plan_path(plan_name), chosen, per_node,
         duration, target["domain"], jtl, report, extra=extra,
+        global_extra=global_extra,
     )
 
     RUNNING.update(active=True, started=datetime.now(), label=key)
@@ -781,9 +811,12 @@ def make_key(host: str) -> str:
     threads="併發執行緒數，例 300",
     mode="協定與方法，例 https-get / https-post / http-get",
     duration="持續秒數，預設 60",
+    nodes="只使用指定節點，逗號分隔，例 HK-Huawei,hk-huawei2；留空為全部",
+    proxy="透過代理池發壓，模擬多來源 IP（需先填 config/proxies.txt）",
 )
 async def start_cmd(interaction: discord.Interaction, url: str, port: int,
-                    threads: int, mode: str = "https-get", duration: int = 60):
+                    threads: int, mode: str = "https-get", duration: int = 60,
+                    nodes: str = "", proxy: bool = False):
     uid = interaction.user.id
     if not is_admin(uid):
         await interaction.response.send_message(
@@ -830,11 +863,38 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
             "已有測試在執行中，請先 `/abort`。", ephemeral=True)
         return
 
-    nodes = load_nodes()
-    chosen, per_node, actual = dist.allocate(threads, nodes)
+    node_map = load_nodes()
+    try:
+        only = parse_node_selection(nodes, node_map)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    http_pool: list = []
+    socks_note = ""
+    if proxy:
+        pool, perrors = load_proxy_pool()
+        http_pool, socks_pool = px.split_by_scheme(pool)
+        if not pool:
+            detail = "\n".join(perrors[:5]) if perrors else "檔案不存在或為空。"
+            await interaction.response.send_message(
+                f"代理模式需要 `config/proxies.txt`，但目前沒有可用代理。\n{detail}",
+                ephemeral=True)
+            return
+        if not http_pool:
+            await interaction.response.send_message(
+                f"清單中只有 {len(socks_pool)} 個 SOCKS 代理。JMeter 的取樣器只能"
+                "設定 HTTP/HTTPS 代理，無法逐執行緒輪換 SOCKS。\n"
+                "請改用 HTTP/HTTPS 代理入口。", ephemeral=True)
+            return
+        if socks_pool:
+            socks_note = (f"\n（已略過 {len(socks_pool)} 個 SOCKS 代理，"
+                          f"本次只用 {len(http_pool)} 個 HTTP 代理）")
+
+    chosen, per_node, actual = dist.allocate(threads, node_map, only=only)
     if not chosen:
         await interaction.response.send_message(
-            f"節點容量不足：目前有效容量 {dist.effective_capacity(nodes)} 併發。",
+            f"節點容量不足：目前有效容量 {dist.effective_capacity(node_map, only)} 併發。",
             ephemeral=True)
         return
 
@@ -864,29 +924,35 @@ async def start_cmd(interaction: discord.Interaction, url: str, port: int,
     if not target.get("plan"):
         target["plan"] = "oneshot.jmx"
     save_targets(data)
+    mode_note = f" proxy={len(http_pool)}" if proxy else ""
     audit("START", str(interaction.user),
-          f"{key} {protocol}://{host}:{port}{path} {threads}x{duration}s {method}")
+          f"{key} {protocol}://{host}:{port}{path} {threads}x{duration}s {method}"
+          f" nodes={','.join(k for k, _ in chosen)}{mode_note}")
 
     await interaction.response.defer()
     await interaction.followup.send(
         f"**開始壓測** · `{protocol}://{host}:{port}{path}`\n"
         f"{method} · 併發 **{threads}**（{len(chosen)} 節點 × {per_node}）"
         f" · 持續 **{duration} 秒**\n"
-        f"操作者 {interaction.user.mention}"
+        f"節點：{'、'.join(k for k, _ in chosen)}\n"
+        + (f"來源：**{len(http_pool)} 個代理輪換**{socks_note}\n" if proxy else "")
+        + f"操作者 {interaction.user.mention}"
     )
     await execute_test(
         interaction.channel, key, target, chosen, per_node, actual,
         duration, str(interaction.user), False,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
-        plan="oneshot.jmx",
+        plan="oneshot-proxy.jmx" if proxy else "oneshot.jmx",
+        global_extra={"proxylist": px.encode_for_jmeter(http_pool)} if proxy else None,
     )
 
 
 # ---------------------------------------------------------------- 階梯壓測
 async def execute_stepped(channel, key: str, target: dict, stages: list[int],
                           duration: int, gap: int, operator: str,
-                          url: str, extra: dict,
-                          plan: str = "oneshot.jmx") -> None:
+                          url: str, extra: dict, only: list = None,
+                          plan: str = "oneshot.jmx",
+                          global_extra: dict = None) -> None:
     """逐級加壓，找出容量拐點。
 
     每級都是一次完整的分散式壓測；級與級之間留 gap 秒，讓 WAF 速率限制
@@ -940,14 +1006,14 @@ async def execute_stepped(channel, key: str, target: dict, stages: list[int],
             break
 
         nodes = load_nodes()
-        chosen, per_node, actual = dist.allocate(threads, nodes)
+        chosen, per_node, actual = dist.allocate(threads, nodes, only=only)
         if not chosen:
             rows.append({
                 "threads": threads, "total": 0, "ok": 0, "errors": 0,
                 "err_pct": 0.0, "rps": 0.0, "ok_rps": 0.0, "avg_ms": 0.0,
                 "p50_ms": 0, "p90_ms": 0, "p99_ms": 0, "max_ms": 0,
                 "healthy": False,
-                "note": f"節點容量不足（有效容量 {dist.effective_capacity(nodes)}）",
+                "note": f"節點容量不足（有效容量 {dist.effective_capacity(nodes, only)}）",
             })
             audit("STEPPED-SKIP", operator, f"{key} {threads} 併發：容量不足")
             continue
@@ -964,6 +1030,7 @@ async def execute_stepped(channel, key: str, target: dict, stages: list[int],
         cmd = dist.build_command(
             JMETER_BIN, plan_path(plan), chosen, per_node,
             duration, target["domain"], jtl, report, extra=extra,
+            global_extra=global_extra,
         )
 
         base = {
@@ -1144,9 +1211,12 @@ async def execute_stepped(channel, key: str, target: dict, stages: list[int],
     duration="每級持續秒數，預設 60",
     gap="級間間隔秒數，預設 60（讓 WAF 限流重置）",
     mode="協定與方法，例 https-get / https-post / http-get",
+    nodes="只使用指定節點，逗號分隔；留空為全部",
+    proxy="透過代理池發壓，模擬多來源 IP（需先填 config/proxies.txt）",
 )
 async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
-                      duration: int = 60, gap: int = 60, mode: str = "https-get"):
+                      duration: int = 60, gap: int = 60, mode: str = "https-get",
+                      nodes: str = "", proxy: bool = False):
     uid = interaction.user.id
     if not is_admin(uid):
         await interaction.response.send_message(
@@ -1206,12 +1276,39 @@ async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
             "已有測試在執行中，請先 `/abort`。", ephemeral=True)
         return
 
-    nodes = load_nodes()
-    chosen, per_node, actual = dist.allocate(peak, nodes)
+    node_map = load_nodes()
+    try:
+        only = parse_node_selection(nodes, node_map)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    http_pool: list = []
+    socks_note = ""
+    if proxy:
+        pool, perrors = load_proxy_pool()
+        http_pool, socks_pool = px.split_by_scheme(pool)
+        if not pool:
+            detail = "\n".join(perrors[:5]) if perrors else "檔案不存在或為空。"
+            await interaction.response.send_message(
+                f"代理模式需要 `config/proxies.txt`，但目前沒有可用代理。\n{detail}",
+                ephemeral=True)
+            return
+        if not http_pool:
+            await interaction.response.send_message(
+                f"清單中只有 {len(socks_pool)} 個 SOCKS 代理。JMeter 的取樣器只能"
+                "設定 HTTP/HTTPS 代理，無法逐執行緒輪換 SOCKS。\n"
+                "請改用 HTTP/HTTPS 代理入口。", ephemeral=True)
+            return
+        if socks_pool:
+            socks_note = (f"\n（已略過 {len(socks_pool)} 個 SOCKS 代理，"
+                          f"本次只用 {len(http_pool)} 個 HTTP 代理）")
+
+    chosen, per_node, actual = dist.allocate(peak, node_map, only=only)
     if not chosen:
         await interaction.response.send_message(
             f"節點容量不足：最高一級需要 {peak} 併發，目前有效容量 "
-            f"{dist.effective_capacity(nodes)}。", ephemeral=True)
+            f"{dist.effective_capacity(node_map, only)}。", ephemeral=True)
         return
 
     key = make_key(host)
@@ -1240,21 +1337,27 @@ async def stepped_cmd(interaction: discord.Interaction, url: str, stages: str,
     save_targets(data)
 
     total_secs = len(stage_list) * duration + (len(stage_list) - 1) * gap
+    mode_note = f" proxy={len(http_pool)}" if proxy else ""
     audit("STEPPED-START", str(interaction.user),
           f"{key} {protocol}://{host}:{port}{path} stages={stages} "
-          f"{duration}s gap={gap}s {method}")
+          f"{duration}s gap={gap}s {method}"
+          f" nodes={','.join(k for k, _ in chosen)}{mode_note}")
 
     await interaction.response.defer()
     await interaction.followup.send(
         f"**開始階梯壓測** · `{protocol}://{host}:{port}{path}`\n"
         f"{method} · 各級 **{' → '.join(map(str, stage_list))}** 併發\n"
         f"每級 {duration}s · 間隔 {gap}s · 預計 {total_secs}s\n"
-        f"操作者 {interaction.user.mention}"
+        f"節點：{'、'.join(k for k, _ in chosen)}\n"
+        + (f"來源：**{len(http_pool)} 個代理輪換**{socks_note}\n" if proxy else "")
+        + f"操作者 {interaction.user.mention}"
     )
     await execute_stepped(
         interaction.channel, key, target, stage_list, duration, gap,
-        str(interaction.user), url=raw,
+        str(interaction.user), url=raw, only=only,
         extra={"protocol": protocol, "port": port, "path": path, "method": method},
+        plan="oneshot-proxy.jmx" if proxy else "oneshot.jmx",
+        global_extra={"proxylist": px.encode_for_jmeter(http_pool)} if proxy else None,
     )
 
 

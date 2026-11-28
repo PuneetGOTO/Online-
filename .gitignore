@@ -31,3 +31,6 @@ tools/runs/
 
 # 執行時產生的授權名單
 config/admins.json
+
+# 代理清單（含帳密，不可提交）
+config/proxies.txt

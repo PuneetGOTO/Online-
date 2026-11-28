@@ -34,14 +34,20 @@ async def check_nodes(nodes: dict) -> dict:
     return {key: await task for key, task in tasks.items()}
 
 
-def effective_capacity(nodes: dict) -> int:
+def effective_capacity(nodes: dict, only: list = None) -> int:
     """實際可承載的總併發。
 
     JMeter 分散式模式下每個 engine 跑相同的執行緒數，所以 n 個節點的有效容量
     是 min(各節點上限) × n，而不是各節點上限相加。
+
+    only: 限定參與的節點名稱；None 表示全部啟用中的節點。
     """
     active = sorted(
-        (v.get("max_threads", 0) for v in nodes.values() if v.get("enabled", True)),
+        (
+            v.get("max_threads", 0)
+            for k, v in nodes.items()
+            if v.get("enabled", True) and (not only or k in only)
+        ),
         reverse=True,
     )
     best = 0
@@ -50,11 +56,14 @@ def effective_capacity(nodes: dict) -> int:
     return best
 
 
-def allocate(total_threads: int, nodes: dict) -> tuple[list, int, int]:
-    """回傳 (選中節點 [(key, cfg)], 每節點執行緒, 實際總併發)。"""
+def allocate(total_threads: int, nodes: dict, only: list = None) -> tuple[list, int, int]:
+    """回傳 (選中節點 [(key, cfg)], 每節點執行緒, 實際總併發)。
+
+    only: 限定參與的節點名稱；None 表示全部啟用中的節點。
+    """
     active = [
         (k, v) for k, v in nodes.items()
-        if v.get("enabled", True)
+        if v.get("enabled", True) and (not only or k in only)
     ]
     active.sort(key=lambda kv: kv[1].get("max_threads", 0), reverse=True)
     for n in range(len(active), 0, -1):
@@ -80,7 +89,13 @@ def build_command(
     jtl: Path,
     report: Path,
     extra: dict = None,
+    global_extra: dict = None,
 ) -> list[str]:
+    """組 JMeter 命令。
+
+    extra        : 以 -J 傳入（只在本機生效）
+    global_extra : 以 -G 傳入（會轉發到所有遠端引擎，分散式模式必須用這個）
+    """
     hosts = ",".join(cfg["host"] + (f":{cfg['port']}" if cfg.get("port", 1099) != 1099 else "")
                      for _, cfg in nodes)
     ramp = compute_ramp(per_node, duration)
@@ -97,10 +112,19 @@ def build_command(
         "-l", str(jtl),
         "-e", "-o", str(report),
     ]
-    # 一次性壓測用：協定、埠、路徑、方法都由指令帶入
+    # 每個參數同時以 -J 與 -G 傳遞：
+    #   -J 只在本機生效（非分散式、或 master 自己也跑時需要）
+    #   -G 會轉發到遠端引擎（分散式時節點靠它拿到 host/path/proxylist）
+    # 只給 -J 的話，遠端引擎會退回計畫裡的預設值（例如 path=/），
+    # 造成「看似有跑、其實打錯路徑」的靜默錯誤。
     for key, value in (extra or {}).items():
         if value is not None and str(value) != "":
             cmd.append(f"-J{key}={value}")
+            cmd.append(f"-G{key}={value}")
+    for key, value in (global_extra or {}).items():
+        if value is not None and str(value) != "":
+            cmd.append(f"-J{key}={value}")
+            cmd.append(f"-G{key}={value}")
     return cmd
 
 
